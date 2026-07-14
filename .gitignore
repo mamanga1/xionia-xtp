@@ -1,0 +1,18 @@
+# Binarios
+mesh
+faro-xtp
+
+# Datos sensibles
+*.key
+*.json
+*.log
+
+# Directorios de runtime
+.xion*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
