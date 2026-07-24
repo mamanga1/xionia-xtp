@@ -65,7 +65,7 @@ func XioniaExportACLPacket() *C.char {
 	}
 
 	for did, peer := range acl.Peers {
-		alias, _ := crypto.ResolveDIDToAlias(did)
+		alias := crypto.ResolveDIDToAlias(did)
 		packet.Peers = append(packet.Peers, ACLPackedPeer{
 			DID:   did,
 			Alias: alias,
@@ -117,7 +117,7 @@ func XioniaGetFaroAddr() *C.char {
 //export XioniaSendChat
 func XioniaSendChat(targetC, msgC *C.char) *C.char {
 	target := C.GoString(targetC)
-	msg := C.GoString(msgC)
+// 	msg := C.GoString(msgC)
 
 	// Resolver alias → DID
 	targetDID, _ := crypto.ResolveNode(target)
@@ -154,7 +154,7 @@ func XioniaGetContactsJSON() *C.char {
 
 	contacts := make([]Contact, 0)
 	for did := range acl.Peers {
-		alias, _ := crypto.ResolveDIDToAlias(did)
+		alias := crypto.ResolveDIDToAlias(did)
 		contacts = append(contacts, Contact{DID: did, Alias: alias})
 	}
 
@@ -167,4 +167,3 @@ func XioniaFreeString(s *C.char) {
 	C.free(unsafe.Pointer(s))
 }
 
-func main() {}

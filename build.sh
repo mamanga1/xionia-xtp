@@ -28,7 +28,10 @@ case $TARGET in
 
         mkdir -p "$OUTPUT_DIR/$LIB_DIR"
 
-        GOOS=android GOARCH=$ANDROID_ARCH CGO_ENABLED=1             go build -buildmode=c-shared             -o "$OUTPUT_DIR/$LIB_DIR/libxionia.so"             xionia-lib/mobile.go
+        GOOS=android GOARCH=$ANDROID_ARCH CGO_ENABLED=1 \
+            go build -buildmode=c-shared \
+            -o "$OUTPUT_DIR/$LIB_DIR/libxionia.so" \
+            .
 
         echo "✅ Librería Android: $OUTPUT_DIR/$LIB_DIR/libxionia.so"
         echo "   Copiar a jami-android/app/src/main/jniLibs/$LIB_DIR/"
@@ -36,19 +39,28 @@ case $TARGET in
 
     linux)
         echo "🐧 Compilando para Linux..."
-        go build -buildmode=c-shared             -o "libxionia.so"             xionia-lib/mobile.go
+        go build -buildmode=c-shared \
+            -o "libxionia.so" \
+            .
         echo "✅ Librería Linux: libxionia.so"
         ;;
 
     windows)
         echo "🪟 Compilando para Windows..."
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=1             CC=x86_64-w64-mingw32-gcc             go build -buildmode=c-shared             -o "xionia.dll"             xionia-lib/mobile.go
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+            CC=x86_64-w64-mingw32-gcc \
+            go build -buildmode=c-shared \
+            -o "xionia.dll" \
+            .
         echo "✅ Librería Windows: xionia.dll"
         ;;
 
     macos)
         echo "🍎 Compilando para macOS..."
-        GOOS=darwin GOARCH=amd64 CGO_ENABLED=1             go build -buildmode=c-shared             -o "libxionia.dylib"             xionia-lib/mobile.go
+        GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 \
+            go build -buildmode=c-shared \
+            -o "libxionia.dylib" \
+            .
         echo "✅ Librería macOS: libxionia.dylib"
         ;;
 
