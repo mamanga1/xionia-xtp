@@ -300,9 +300,30 @@ kid := crypto.DeriveKeyID(myID.PubKeyX[:])
 return fmt.Sprintf("%s|%s", hex.EncodeToString(kid[:]), base64.StdEncoding.EncodeToString(encrypted)), nil
 }
 
+func sendAnnounce(myID *crypto.Identity) {
+connMu.Lock()
+noConn := globalConn == nil && globalConnWS == nil
+connMu.Unlock()
+if noConn {
+return
+}
+ts := fmt.Sprintf("%d", time.Now().Unix())
+sig := base64.StdEncoding.EncodeToString(myID.SignMessage([]byte(ts)))
+msg := fmt.Sprintf("ANNOUNCE %s %s %s", myID.DID, ts, sig)
+if err := sendToFaro(addPadding(msg)); err != nil {
+logf("sendAnnounce ERROR: %v", err)
+} else {
+logf("ANNOUNCE enviado")
+}
+}
+
 func runNode(myID *crypto.Identity, quit chan struct{}) {
 // Carga inicial
 XioniaReloadACL()
+
+// Primer ANNOUNCE inmediato (no esperar los 15s del ticker) para
+// re-punchear el NAT lo antes posible al conectar/reconectar.
+sendAnnounce(myID)
 
 // ANNOUNCE cada 15s
 go func() {
@@ -313,16 +334,7 @@ select {
 case <-quit:
 return
 case <-ticker.C:
-connMu.Lock()
-noConn := globalConn == nil && globalConnWS == nil
-connMu.Unlock()
-if noConn {
-continue
-}
-ts := fmt.Sprintf("%d", time.Now().Unix())
-sig := base64.StdEncoding.EncodeToString(myID.SignMessage([]byte(ts)))
-msg := fmt.Sprintf("ANNOUNCE %s %s %s", myID.DID, ts, sig)
-_ = sendToFaro(addPadding(msg))
+sendAnnounce(myID)
 }
 }
 }()
@@ -646,6 +658,14 @@ return C.CString("ERROR: " + err.Error())
 }
 
 startNodeIfNeeded()
+
+// Si el nodo ya estaba corriendo (ej: la app vuelve de background y
+// Flutter llama ConnectFaro de nuevo para forzar reconexión), el
+// socket se reabrió arriba pero el goroutine de announce sigue con
+// su propio timer de 15s. Mandamos uno ya mismo para no esperar.
+if id := ensureIdentity(); id != nil {
+go sendAnnounce(id)
+}
 return C.CString("OK")
 }
 

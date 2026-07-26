@@ -1,9 +1,52 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'flutter_bridge.dart';
+
+/// Único punto que llama a Xionia.pollMessages(). XioniaPollMessages()
+/// del lado Go VACÍA la cola en cada llamada — si dos widgets sondean
+/// por su cuenta (como pasaba antes con HomeScreen y ChatScreen a la
+/// vez), el que gana la carrera se queda con el mensaje y el otro no
+/// lo ve nunca. Acá hay un solo timer que reparte cada mensaje a quien
+/// esté escuchando el stream.
+class MessageBus {
+  MessageBus._();
+  static final MessageBus instance = MessageBus._();
+
+  final _controller = StreamController<String>.broadcast();
+  Stream<String> get stream => _controller.stream;
+  Timer? _timer;
+
+  void start() {
+    if (_timer != null) return;
+    _timer = Timer.periodic(const Duration(seconds: 2), (_) => _tick());
+  }
+
+  void stop() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  /// Sondea ahora mismo, sin esperar al próximo tick del timer (útil al
+  /// volver del background, para no perder mensajes que llegaron
+  /// mientras la app estaba pausada).
+  void pollNow() => _tick();
+
+  void _tick() {
+    if (!Xionia.ready) return;
+    try {
+      final polled = Xionia.pollMessages();
+      for (final m in polled) {
+        _controller.add(m.toString());
+      }
+    } catch (_) {
+      // sin conexión / sin identidad todavía: ignorar este ciclo
+    }
+  }
+}
 
 void main() => runApp(const XionChatApp());
 
@@ -33,17 +76,17 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String myDID = '...';
   String faroStatus = 'off';
   List<dynamic> contacts = [];
-  List<dynamic> messages = [];
-  Timer? _pollTimer;
   String? _loadError;
+  String _lastFaroAddr = '';
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _init();
   }
 
@@ -58,20 +101,30 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       myDID = Xionia.getMyDID();
       faroStatus = Xionia.getFaroAddr();
+      // faroStatus viene como "IP:PUERTO (UDP)" / "(WS)" / "(off)" —
+      // nos quedamos solo con la dirección para poder reconectar solos.
+      final raw = faroStatus.split(' (').first;
+      if (raw.isNotEmpty && raw != 'off') _lastFaroAddr = raw;
       _loadContacts();
     });
-    _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
+    MessageBus.instance.start();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && Xionia.ready && _lastFaroAddr.isNotEmpty) {
+      // La app volvió de segundo plano: Android puede haber matado el
+      // mapeo NAT del socket UDP mientras estaba en Doze/suspendida.
+      // Reconectamos y forzamos un ANNOUNCE ya mismo en vez de esperar
+      // pasivamente al próximo tick del ticker de 15s del lado Go.
+      Xionia.connectFaro(_lastFaroAddr);
+      MessageBus.instance.pollNow();
+      setState(() => faroStatus = Xionia.getFaroAddr());
+    }
   }
 
   void _loadContacts() {
     setState(() => contacts = Xionia.getContacts());
-  }
-
-  void _poll() {
-    final msgs = Xionia.pollMessages();
-    if (msgs.isNotEmpty) {
-      setState(() => messages.addAll(msgs));
-    }
   }
 
   void _connect() {
@@ -96,6 +149,7 @@ class _HomeScreenState extends State<HomeScreen> {
             TextButton(
               onPressed: () {
                 final r = Xionia.connectFaro(ctrl.text);
+                _lastFaroAddr = ctrl.text.trim();
                 Navigator.pop(context);
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(r), backgroundColor: const Color(0xFF1F2C34)));
                 setState(() => faroStatus = Xionia.getFaroAddr());
@@ -276,7 +330,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    _pollTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
@@ -381,24 +435,90 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final ctrl = TextEditingController();
   final List<String> msgs = [];
-  Timer? _timer;
+  StreamSubscription<String>? _sub;
   final ScrollController _scrollCtrl = ScrollController();
+
+  // Grabación: por defecto el chat es efímero (se borra al salir).
+  // Si el usuario prende el ON, se guarda en un archivo local por
+  // contacto y se recupera la próxima vez que entre a ese chat.
+  bool _recording = false;
+
+  String get _historyFileName {
+    final safe = widget.did.replaceAll(RegExp(r'[^A-Za-z0-9]'), '_');
+    return 'chat_$safe.json';
+  }
+
+  Future<File> _historyFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/$_historyFileName');
+  }
 
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 2), (_) {
-      final polled = Xionia.pollMessages();
-      for (final m in polled) {
-        // m viene como "alias: CHAT:eyyy" o "did:maia:...: CHAT:eyyy"
-        if (m.toString().contains(widget.alias) || m.toString().contains(widget.did)) {
-          setState(() => msgs.add(m.toString()));
-          Future.delayed(const Duration(milliseconds: 100), () {
-            if (_scrollCtrl.hasClients) {
-              _scrollCtrl.animateTo(_scrollCtrl.position.maxScrollExtent, duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
-            }
-          });
-        }
+    _loadHistoryIfAny();
+    _sub = MessageBus.instance.stream.listen((m) {
+      // m viene como "alias: CHAT:eyyy" o "did:maia:...: CHAT:eyyy"
+      if (m.contains(widget.alias) || m.contains(widget.did)) {
+        setState(() => msgs.add(m));
+        _saveIfRecording();
+        _scrollToEnd();
+      }
+    });
+  }
+
+  Future<void> _loadHistoryIfAny() async {
+    try {
+      final f = await _historyFile();
+      if (await f.exists()) {
+        final data = jsonDecode(await f.readAsString()) as List<dynamic>;
+        setState(() {
+          _recording = true; // si hay historial guardado, asumimos que seguía ON
+          msgs.addAll(data.map((e) => e.toString()));
+        });
+        _scrollToEnd();
+      }
+    } catch (_) {
+      // sin historial o archivo corrupto: arrancamos en blanco, sin drama
+    }
+  }
+
+  Future<void> _saveIfRecording() async {
+    if (!_recording) return;
+    try {
+      final f = await _historyFile();
+      await f.writeAsString(jsonEncode(msgs));
+    } catch (_) {
+      // si falla el guardado no interrumpimos el chat
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    setState(() => _recording = !_recording);
+    if (_recording) {
+      await _saveIfRecording();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Grabando conversación'), duration: Duration(seconds: 1)),
+        );
+      }
+    } else {
+      try {
+        final f = await _historyFile();
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Chat efímero: se borra al salir'), duration: Duration(seconds: 1)),
+        );
+      }
+    }
+  }
+
+  void _scrollToEnd() {
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (_scrollCtrl.hasClients) {
+        _scrollCtrl.animateTo(_scrollCtrl.position.maxScrollExtent, duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
       }
     });
   }
@@ -407,18 +527,15 @@ class _ChatScreenState extends State<ChatScreen> {
     if (ctrl.text.isEmpty) return;
     final r = Xionia.sendChat(widget.did, ctrl.text);
     setState(() => msgs.add('Tú: ${ctrl.text}'));
+    _saveIfRecording();
     ctrl.clear();
-    Future.delayed(const Duration(milliseconds: 100), () {
-      if (_scrollCtrl.hasClients) {
-        _scrollCtrl.animateTo(_scrollCtrl.position.maxScrollExtent, duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
-      }
-    });
+    _scrollToEnd();
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(r), duration: const Duration(seconds: 1), backgroundColor: const Color(0xFF1F2C34)));
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _sub?.cancel();
     _scrollCtrl.dispose();
     super.dispose();
   }
@@ -427,7 +544,18 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF0B141A),
-      appBar: AppBar(backgroundColor: const Color(0xFF1F2C34), title: Text(widget.alias, style: const TextStyle(color: Colors.white))),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1F2C34),
+        title: Text(widget.alias, style: const TextStyle(color: Colors.white)),
+        actions: [
+          IconButton(
+            tooltip: _recording ? 'Grabando (tocá para volver a efímero)' : 'Chat efímero (tocá para grabar)',
+            icon: Icon(_recording ? Icons.fiber_manual_record : Icons.radio_button_unchecked,
+                color: _recording ? Colors.redAccent : Colors.grey),
+            onPressed: _toggleRecording,
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(
