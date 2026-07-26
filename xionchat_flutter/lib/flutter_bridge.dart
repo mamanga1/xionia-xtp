@@ -3,10 +3,6 @@ import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
 
-final DynamicLibrary _lib = Platform.isAndroid
-    ? DynamicLibrary.open('libxionia.so')
-    : DynamicLibrary.process();
-
 typedef _SetDataDirD = void Function(Pointer<Utf8>);
 typedef _ConnectFaroD = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _GetMyDIDD = Pointer<Utf8> Function();
@@ -23,63 +19,219 @@ typedef _GetFaroD = Pointer<Utf8> Function();
 typedef _SetAliasD = void Function(Pointer<Utf8>, Pointer<Utf8>);
 typedef _RemoveAliasD = void Function(Pointer<Utf8>);
 
-final _setDataDir = _lib.lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaSetDataDir').asFunction<_SetDataDirD>();
-final _connectFaro = _lib.lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Utf8>)>>('XioniaConnectFaro').asFunction<_ConnectFaroD>();
-final _getMyDID = _lib.lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetMyDID').asFunction<_GetMyDIDD>();
-final _getMyIdentity = _lib.lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetMyIdentity').asFunction<_GetMyIdentityD>();
-final _exportACL = _lib.lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaExportACLPacket').asFunction<_ExportACLD>();
-final _importACL = _lib.lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaImportACLPacket').asFunction<_ImportACLD>();
-final _reloadACL = _lib.lookup<NativeFunction<Void Function()>>('XioniaReloadACL').asFunction<_ReloadACLD>();
-final _getContacts = _lib.lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetContactsJSON').asFunction<_GetContactsD>();
-final _sendChat = _lib.lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>)>>('XioniaSendChat').asFunction<_SendChatD>();
-final _pollMsg = _lib.lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaPollMessages').asFunction<_PollMsgD>();
-final _reset = _lib.lookup<NativeFunction<Void Function()>>('XioniaReset').asFunction<_ResetD>();
-final _free = _lib.lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaFreeString').asFunction<_FreeD>();
-final _getFaro = _lib.lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetFaroAddr').asFunction<_GetFaroD>();
-final _setAlias = _lib.lookup<NativeFunction<Void Function(Pointer<Utf8>, Pointer<Utf8>)>>('XioniaSetAlias').asFunction<_SetAliasD>();
-final _removeAlias = _lib.lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaRemoveAlias').asFunction<_RemoveAliasD>();
+/// Excepción específica para fallos al cargar/enlazar libxionia.so,
+/// para poder distinguirlos de errores normales de la app en la UI.
+class XioniaLoadException implements Exception {
+  final String message;
+  XioniaLoadException(this.message);
+  @override
+  String toString() => message;
+}
 
 class Xionia {
+  static DynamicLibrary? _lib;
+  static String? _loadError;
+
+  static _SetDataDirD? _setDataDir;
+  static _ConnectFaroD? _connectFaro;
+  static _GetMyDIDD? _getMyDID;
+  static _GetMyIdentityD? _getMyIdentity;
+  static _ExportACLD? _exportACL;
+  static _ImportACLD? _importACL;
+  static _ReloadACLD? _reloadACL;
+  static _GetContactsD? _getContacts;
+  static _SendChatD? _sendChat;
+  static _PollMsgD? _pollMsg;
+  static _ResetD? _reset;
+  static _FreeD? _free;
+  static _GetFaroD? _getFaro;
+  static _SetAliasD? _setAlias;
+  static _RemoveAliasD? _removeAlias;
+
+  /// true si libxionia.so se cargó y todos los símbolos se resolvieron OK.
+  static bool get ready => _lib != null;
+
+  /// Mensaje de error si la carga falló (null si todo OK o si todavía
+  /// no se llamó a init()).
+  static String? get loadError => _loadError;
+
+  /// Debe llamarse una vez al arrancar la app, antes de usar cualquier
+  /// otro método. No lanza: si algo falla, marca ready=false y guarda
+  /// el motivo en loadError.
+  static void init() {
+    if (_lib != null || _loadError != null) return; // ya inicializado
+    try {
+      final lib = Platform.isAndroid
+          ? DynamicLibrary.open('libxionia.so')
+          : DynamicLibrary.process();
+
+      _setDataDir = lib
+          .lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaSetDataDir')
+          .asFunction();
+      _connectFaro = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Utf8>)>>('XioniaConnectFaro')
+          .asFunction();
+      _getMyDID = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetMyDID')
+          .asFunction();
+      _getMyIdentity = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetMyIdentity')
+          .asFunction();
+      _exportACL = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaExportACLPacket')
+          .asFunction();
+      _importACL = lib
+          .lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaImportACLPacket')
+          .asFunction();
+      _reloadACL = lib
+          .lookup<NativeFunction<Void Function()>>('XioniaReloadACL')
+          .asFunction();
+      _getContacts = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetContactsJSON')
+          .asFunction();
+      _sendChat = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>)>>(
+              'XioniaSendChat')
+          .asFunction();
+      _pollMsg = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaPollMessages')
+          .asFunction();
+      _reset = lib.lookup<NativeFunction<Void Function()>>('XioniaReset').asFunction();
+      _free = lib
+          .lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaFreeString')
+          .asFunction();
+      _getFaro = lib
+          .lookup<NativeFunction<Pointer<Utf8> Function()>>('XioniaGetFaroAddr')
+          .asFunction();
+      _setAlias = lib
+          .lookup<NativeFunction<Void Function(Pointer<Utf8>, Pointer<Utf8>)>>('XioniaSetAlias')
+          .asFunction();
+      _removeAlias = lib
+          .lookup<NativeFunction<Void Function(Pointer<Utf8>)>>('XioniaRemoveAlias')
+          .asFunction();
+
+      _lib = lib;
+    } catch (e) {
+      _lib = null;
+      _loadError = 'No se pudo cargar libxionia.so: $e\n'
+          'Verificá que exista el .so para el ABI de este dispositivo/emulador '
+          '(arm64-v8a, armeabi-v7a o x86_64) en android/app/src/main/jniLibs/.';
+    }
+  }
+
+  static void _checkReady() {
+    if (_lib == null) {
+      throw XioniaLoadException(_loadError ?? 'Xionia no inicializado: llamá a Xionia.init() primero.');
+    }
+  }
+
   static void setDataDir(String path) {
-    final p = path.toNativeUtf8(); _setDataDir(p); calloc.free(p);
+    _checkReady();
+    final p = path.toNativeUtf8();
+    _setDataDir!(p);
+    calloc.free(p);
   }
+
   static String connectFaro(String addr) {
-    final p = addr.toNativeUtf8(); final r = _connectFaro(p); calloc.free(p);
-    final s = r.toDartString(); _free(r); return s;
+    _checkReady();
+    final p = addr.toNativeUtf8();
+    final r = _connectFaro!(p);
+    calloc.free(p);
+    final s = r.toDartString();
+    _free!(r);
+    return s;
   }
+
   static String getMyDID() {
-    final r = _getMyDID(); final s = r.toDartString(); _free(r); return s;
+    _checkReady();
+    final r = _getMyDID!();
+    final s = r.toDartString();
+    _free!(r);
+    return s;
   }
+
   static String getMyIdentity() {
-    final r = _getMyIdentity(); final s = r.toDartString(); _free(r); return s;
+    _checkReady();
+    final r = _getMyIdentity!();
+    final s = r.toDartString();
+    _free!(r);
+    return s;
   }
+
   static String exportACL() {
-    final r = _exportACL(); final s = r.toDartString(); _free(r); return s;
+    _checkReady();
+    final r = _exportACL!();
+    final s = r.toDartString();
+    _free!(r);
+    return s;
   }
+
   static void importACL(String packet) {
-    final p = packet.toNativeUtf8(); _importACL(p); calloc.free(p);
+    _checkReady();
+    final p = packet.toNativeUtf8();
+    _importACL!(p);
+    calloc.free(p);
   }
-  static void reloadACL() => _reloadACL();
+
+  static void reloadACL() {
+    _checkReady();
+    _reloadACL!();
+  }
+
   static List<dynamic> getContacts() {
-    final r = _getContacts(); final s = r.toDartString(); _free(r); return jsonDecode(s);
+    _checkReady();
+    final r = _getContacts!();
+    final s = r.toDartString();
+    _free!(r);
+    return jsonDecode(s);
   }
+
   static String sendChat(String target, String msg) {
-    final t = target.toNativeUtf8(); final m = msg.toNativeUtf8();
-    final r = _sendChat(t, m); calloc.free(t); calloc.free(m);
-    final s = r.toDartString(); _free(r); return s;
+    _checkReady();
+    final t = target.toNativeUtf8();
+    final m = msg.toNativeUtf8();
+    final r = _sendChat!(t, m);
+    calloc.free(t);
+    calloc.free(m);
+    final s = r.toDartString();
+    _free!(r);
+    return s;
   }
+
   static List<dynamic> pollMessages() {
-    final r = _pollMsg(); final s = r.toDartString(); _free(r); return jsonDecode(s);
+    _checkReady();
+    final r = _pollMsg!();
+    final s = r.toDartString();
+    _free!(r);
+    return jsonDecode(s);
   }
-  static void reset() => _reset();
+
+  static void reset() {
+    _checkReady();
+    _reset!();
+  }
+
   static String getFaroAddr() {
-    final r = _getFaro(); final s = r.toDartString(); _free(r); return s;
+    _checkReady();
+    final r = _getFaro!();
+    final s = r.toDartString();
+    _free!(r);
+    return s;
   }
+
   static void setAlias(String did, String alias) {
-    final d = did.toNativeUtf8(); final a = alias.toNativeUtf8();
-    _setAlias(d, a); calloc.free(d); calloc.free(a);
+    _checkReady();
+    final d = did.toNativeUtf8();
+    final a = alias.toNativeUtf8();
+    _setAlias!(d, a);
+    calloc.free(d);
+    calloc.free(a);
   }
+
   static void removeAlias(String did) {
-    final d = did.toNativeUtf8(); _removeAlias(d); calloc.free(d);
+    _checkReady();
+    final d = did.toNativeUtf8();
+    _removeAlias!(d);
+    calloc.free(d);
   }
 }

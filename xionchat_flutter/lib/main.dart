@@ -39,6 +39,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<dynamic> contacts = [];
   List<dynamic> messages = [];
   Timer? _pollTimer;
+  String? _loadError;
 
   @override
   void initState() {
@@ -47,6 +48,11 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _init() async {
+    Xionia.init();
+    if (!Xionia.ready) {
+      setState(() => _loadError = Xionia.loadError);
+      return;
+    }
     final dir = await getApplicationDocumentsDirectory();
     Xionia.setDataDir(dir.path);
     setState(() {
@@ -276,6 +282,29 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_loadError != null) {
+      return Scaffold(
+        backgroundColor: const Color(0xFF0B141A),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.error_outline, color: Colors.redAccent, size: 48),
+                const SizedBox(height: 16),
+                const Text('No se pudo iniciar el motor XionIA',
+                    style: TextStyle(color: Colors.white, fontSize: 16)),
+                const SizedBox(height: 8),
+                Text(_loadError!,
+                    style: const TextStyle(color: Colors.grey, fontSize: 12),
+                    textAlign: TextAlign.center),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     return Scaffold(
       backgroundColor: const Color(0xFF0B141A),
       appBar: AppBar(

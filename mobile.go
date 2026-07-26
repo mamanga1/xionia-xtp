@@ -75,18 +75,28 @@ SharedKey []byte
 }
 
 var (
-globalConn     *net.UDPConn
-globalConnWS   *websocket.Conn
-globalUseWS    bool
-globalQuit     = make(chan struct{})
-globalID       *crypto.Identity
-nodeRunning    bool
-nodeMu         sync.Mutex
-recvMu         sync.Mutex
-recvMessages   []string
-aclIndexMu     sync.RWMutex
-globalACLIdx   map[[4]byte]peerKeys
-lastPublicIP   string
+// connMu protege TODO el estado de la conexión activa (globalConn,
+// globalConnWS, globalUseWS). Se toca desde la goroutine de runNode()
+// Y desde llamadas FFI disparadas por la UI de Flutter en paralelo,
+// así que sin este mutex hay una carrera de datos real.
+connMu       sync.Mutex
+globalConn   *net.UDPConn
+globalConnWS *websocket.Conn
+globalUseWS  bool
+
+// quitMu protege el ciclo de vida de globalQuit para que Reset() no
+// pueda hacer close() de un canal ya cerrado (panic).
+quitMu     sync.Mutex
+globalQuit = make(chan struct{})
+
+globalID     *crypto.Identity
+nodeRunning  bool
+nodeMu       sync.Mutex
+recvMu       sync.Mutex
+recvMessages []string
+aclIndexMu   sync.RWMutex
+globalACLIdx map[[4]byte]peerKeys
+lastPublicIP string
 )
 
 func ensureIdentity() *crypto.Identity {
@@ -107,6 +117,8 @@ return globalID
 
 func connectToFaro(addr string) error {
 logf("Conectando a: %s", addr)
+
+connMu.Lock()
 if globalConn != nil {
 globalConn.Close()
 globalConn = nil
@@ -115,6 +127,8 @@ if globalConnWS != nil {
 globalConnWS.Close()
 globalConnWS = nil
 }
+connMu.Unlock()
+
 if strings.Contains(addr, ":443") || strings.Contains(addr, ":8443") {
 wsURL := fmt.Sprintf("wss://%s/ws", addr)
 dialer := websocket.Dialer{
@@ -125,8 +139,10 @@ ws, _, err := dialer.Dial(wsURL, nil)
 if err != nil {
 return err
 }
+connMu.Lock()
 globalConnWS = ws
 globalUseWS = true
+connMu.Unlock()
 return nil
 }
 udpAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -137,32 +153,46 @@ conn, err := net.DialUDP("udp", nil, udpAddr)
 if err != nil {
 return err
 }
+connMu.Lock()
 globalConn = conn
 globalUseWS = false
+connMu.Unlock()
 return nil
 }
 
 func sendToFaro(msg string) error {
-if globalUseWS && globalConnWS != nil {
-return globalConnWS.WriteMessage(websocket.TextMessage, []byte(msg))
+connMu.Lock()
+useWS := globalUseWS
+connWS := globalConnWS
+conn := globalConn
+connMu.Unlock()
+
+if useWS && connWS != nil {
+return connWS.WriteMessage(websocket.TextMessage, []byte(msg))
 }
-if globalConn != nil {
-_, err := globalConn.Write([]byte(msg))
+if conn != nil {
+_, err := conn.Write([]byte(msg))
 return err
 }
 return fmt.Errorf("sin conexion")
 }
 
 func readFromFaro() (string, error) {
-if globalUseWS && globalConnWS != nil {
-globalConnWS.SetReadDeadline(time.Now().Add(15 * time.Second))
-_, msg, err := globalConnWS.ReadMessage()
+connMu.Lock()
+useWS := globalUseWS
+connWS := globalConnWS
+conn := globalConn
+connMu.Unlock()
+
+if useWS && connWS != nil {
+connWS.SetReadDeadline(time.Now().Add(15 * time.Second))
+_, msg, err := connWS.ReadMessage()
 return string(msg), err
 }
-if globalConn != nil {
+if conn != nil {
 buf := make([]byte, 65536)
-globalConn.SetReadDeadline(time.Now().Add(15 * time.Second))
-n, _, err := globalConn.ReadFromUDP(buf)
+conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+n, _, err := conn.ReadFromUDP(buf)
 if err != nil {
 return "", err
 }
@@ -270,17 +300,7 @@ kid := crypto.DeriveKeyID(myID.PubKeyX[:])
 return fmt.Sprintf("%s|%s", hex.EncodeToString(kid[:]), base64.StdEncoding.EncodeToString(encrypted)), nil
 }
 
-func handleCommand(cmd string) string {
-if strings.HasPrefix(cmd, "PING") || strings.HasPrefix(cmd, "/ping") {
-return fmt.Sprintf("✅ PONG | %s", time.Now().Format("15:04:05"))
-}
-if strings.HasPrefix(cmd, "CHAT:") {
-return fmt.Sprintf("✅ Recibido: %s", strings.TrimPrefix(cmd, "CHAT:"))
-}
-return "✅ ACK"
-}
-
-func runNode(myID *crypto.Identity) {
+func runNode(myID *crypto.Identity, quit chan struct{}) {
 // Carga inicial
 XioniaReloadACL()
 
@@ -290,10 +310,13 @@ ticker := time.NewTicker(15 * time.Second)
 defer ticker.Stop()
 for {
 select {
-case <-globalQuit:
+case <-quit:
 return
 case <-ticker.C:
-if globalConn == nil && globalConnWS == nil {
+connMu.Lock()
+noConn := globalConn == nil && globalConnWS == nil
+connMu.Unlock()
+if noConn {
 continue
 }
 ts := fmt.Sprintf("%d", time.Now().Unix())
@@ -307,14 +330,20 @@ _ = sendToFaro(addPadding(msg))
 // Listener principal (con reconexión como shell.go)
 for {
 select {
-case <-globalQuit:
+case <-quit:
 return
 default:
 }
 
 raw, err := readFromFaro()
 if err != nil {
-// Socket roto: reconectar
+select {
+case <-quit:
+return
+default:
+}
+// Socket roto o timeout: reconectar
+connMu.Lock()
 if !globalUseWS && globalConn != nil {
 globalConn.Close()
 globalConn = nil
@@ -323,6 +352,7 @@ if globalUseWS && globalConnWS != nil {
 globalConnWS.Close()
 globalConnWS = nil
 }
+connMu.Unlock()
 time.Sleep(2 * time.Second)
 addr := config.GetFaroAddr()
 if addr != "" {
@@ -457,20 +487,27 @@ if id == nil {
 return
 }
 nodeRunning = true
-go runNode(id)
+
+quitMu.Lock()
+quit := globalQuit
+quitMu.Unlock()
+
+go runNode(id, quit)
 }
 
 // ========== EXPORTADAS ==========
 
 //export XioniaReset
 func XioniaReset() {
-select {
-case <-globalQuit:
-globalQuit = make(chan struct{})
-default:
+nodeMu.Lock()
+quitMu.Lock()
 close(globalQuit)
 globalQuit = make(chan struct{})
-}
+quitMu.Unlock()
+nodeRunning = false
+nodeMu.Unlock()
+
+connMu.Lock()
 if globalConn != nil {
 globalConn.Close()
 globalConn = nil
@@ -479,7 +516,8 @@ if globalConnWS != nil {
 globalConnWS.Close()
 globalConnWS = nil
 }
-nodeRunning = false
+connMu.Unlock()
+
 inDataDir(func() {
 crypto.ClearACL()
 if aliases, err := crypto.LoadAliases(); err == nil {
@@ -613,10 +651,15 @@ return C.CString("OK")
 
 //export XioniaGetFaroAddr
 func XioniaGetFaroAddr() *C.char {
-if globalConnWS != nil {
+connMu.Lock()
+hasWS := globalConnWS != nil
+hasUDP := globalConn != nil
+connMu.Unlock()
+
+if hasWS {
 return C.CString(config.GetFaroAddr() + " (WS)")
 }
-if globalConn != nil {
+if hasUDP {
 return C.CString(config.GetFaroAddr() + " (UDP)")
 }
 return C.CString(config.GetFaroAddr() + " (off)")

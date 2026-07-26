@@ -1,0 +1,4 @@
+*.so
+*.zip
+android/jniLibs/
+xionchat_flutter/android/app/src/main/jniLibs/
