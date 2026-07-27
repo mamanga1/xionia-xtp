@@ -1,8 +1,8 @@
 # XionChat v0.1
 
-**Jami UI + XionIA Motor**
+**XionIA Motor**
 
-Cliente de mensajería soberana con interfaz gráfica (Jami) y motor criptográfico (XionIA Faraday).
+Cliente de mensajería soberana con interfaz gráfica y motor criptográfico (XionIA Faraday).
 
 ## Características
 - 🛡️ Identidad DID:MAIA
