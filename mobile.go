@@ -13,6 +13,7 @@ import (
 "encoding/json"
 "fmt"
 "net"
+"net/http"
 "os"
 "strings"
 "sync"
@@ -20,6 +21,7 @@ import (
 "unsafe"
 
 "github.com/gorilla/websocket"
+"github.com/mr-tron/base58"
 "xionia-xtp/src/config"
 "xionia-xtp/src/crypto"
 )
@@ -129,34 +131,106 @@ globalConnWS = nil
 }
 connMu.Unlock()
 
-if strings.Contains(addr, ":443") || strings.Contains(addr, ":8443") {
-wsURL := fmt.Sprintf("wss://%s/ws", addr)
-dialer := websocket.Dialer{
-TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
-HandshakeTimeout: 5 * time.Second,
-}
-ws, _, err := dialer.Dial(wsURL, nil)
-if err != nil {
-return err
-}
-connMu.Lock()
-globalConnWS = ws
-globalUseWS = true
-connMu.Unlock()
+// 1. UDP primero (default, incluye el propio 443) — con Gate DID.
+if err := connectUDP(addr); err == nil {
 return nil
 }
+
+// 2. WSS fallback — con Gate DID por headers.
+if err := connectWS(addr); err == nil {
+return nil
+}
+
+return fmt.Errorf("sin ruta al faro %s", addr)
+}
+
+func connectUDP(addr string) error {
+myID := ensureIdentity()
+if myID == nil {
+return fmt.Errorf("sin identidad")
+}
+
 udpAddr, err := net.ResolveUDPAddr("udp", addr)
 if err != nil {
-return err
+return fmt.Errorf("resolviendo UDP: %v", err)
 }
 conn, err := net.DialUDP("udp", nil, udpAddr)
 if err != nil {
+return fmt.Errorf("conectando UDP: %v", err)
+}
+
+// Handshake del Gate DID: sin esto el faro descarta todo en silencio.
+hs, err := crypto.CreateHandshake(myID)
+if err != nil {
+conn.Close()
 return err
 }
+conn.Write(hs)
+
+conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+ack := make([]byte, 1024)
+n, err := conn.Read(ack)
+if err != nil {
+conn.Close()
+return fmt.Errorf("timeout handshake UDP")
+}
+if !strings.Contains(string(ack[:n]), `"ack":"ok"`) {
+conn.Close()
+return fmt.Errorf("handshake UDP rechazado")
+}
+conn.SetReadDeadline(time.Time{})
+
 connMu.Lock()
 globalConn = conn
 globalUseWS = false
 connMu.Unlock()
+logf("Conectado por UDP (Gate OK): %s", addr)
+return nil
+}
+
+func connectWS(addr string) error {
+myID := ensureIdentity()
+if myID == nil {
+return fmt.Errorf("sin identidad")
+}
+
+wsHost := addr
+if !strings.Contains(wsHost, ":") {
+wsHost += ":443"
+}
+if strings.HasSuffix(wsHost, ":54321") {
+wsHost = strings.TrimSuffix(wsHost, ":54321") + ":443"
+}
+
+nonce := make([]byte, 32)
+rand.Read(nonce)
+ts := time.Now().Unix()
+nonceB64 := base64.StdEncoding.EncodeToString(nonce)
+msg := fmt.Sprintf("%s|%d|%s", myID.DID, ts, nonceB64)
+sig := myID.SignMessage([]byte(msg))
+
+headers := http.Header{}
+headers.Set("X-Xionia-DID", myID.DID)
+headers.Set("X-Xionia-Pub", base58.Encode(myID.PubKeyEd))
+headers.Set("X-Xionia-TS", fmt.Sprintf("%d", ts))
+headers.Set("X-Xionia-Nonce", nonceB64)
+headers.Set("X-Xionia-Sig", base64.StdEncoding.EncodeToString(sig))
+
+wsURL := fmt.Sprintf("wss://%s/ws", wsHost)
+dialer := websocket.Dialer{
+TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+HandshakeTimeout: 5 * time.Second,
+}
+ws, _, err := dialer.Dial(wsURL, headers)
+if err != nil {
+return fmt.Errorf("conectando WS: %v", err)
+}
+
+connMu.Lock()
+globalConnWS = ws
+globalUseWS = true
+connMu.Unlock()
+logf("Conectado por WSS (Gate OK): %s", wsHost)
 return nil
 }
 
@@ -318,6 +392,23 @@ logf("ANNOUNCE enviado")
 }
 
 func runNode(myID *crypto.Identity, quit chan struct{}) {
+// Red de seguridad: en una lib cgo un panic sin recuperar en
+// cualquier goroutine tira abajo el proceso entero de la app
+// (no solo esta goroutine). Sin esto, un bug de red podría
+// crashear XionChat en vez de solo reconectar.
+defer func() {
+if r := recover(); r != nil {
+logf("PANIC recuperado en runNode: %v — reintentando en 2s", r)
+nodeMu.Lock()
+stillWanted := nodeRunning
+nodeMu.Unlock()
+time.Sleep(2 * time.Second)
+if stillWanted {
+go runNode(myID, quit)
+}
+}
+}()
+
 // Carga inicial
 XioniaReloadACL()
 
