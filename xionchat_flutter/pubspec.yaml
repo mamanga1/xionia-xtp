@@ -11,6 +11,8 @@ dependencies:
     sdk: flutter
   ffi: ^2.1.0
   path_provider: ^2.1.1
+  permission_handler: ^11.0.0
+  flutter_local_notifications: ^17.0.0
 
 dev_dependencies:
   flutter_test:

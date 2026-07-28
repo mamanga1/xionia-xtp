@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'flutter_bridge.dart';
 
 /// Único punto que llama a Xionia.pollMessages(). XioniaPollMessages()
@@ -19,6 +21,34 @@ class MessageBus {
   final _controller = StreamController<String>.broadcast();
   Stream<String> get stream => _controller.stream;
   Timer? _timer;
+
+  // Buffer circular en RAM (no se guarda a disco). Vive mientras el
+  // proceso de la app esté vivo; si la matás del todo, se pierde —
+  // sigue siendo "efímero" en ese sentido, pero sobrevive a cerrar y
+  // reabrir la pantalla de chat dentro de la misma sesión.
+  final List<_BusEntry> _recent = [];
+  static const _recentCap = 500;
+
+  void _remember(_BusEntry e) {
+    _recent.add(e);
+    if (_recent.length > _recentCap) _recent.removeAt(0);
+  }
+
+  /// Mensajes propios enviados desde este dispositivo (no se
+  /// retransmiten por el stream, solo quedan para poder reconstruir
+  /// el chat si lo cerrás y volvés a abrir).
+  void addSent(String did, String displayText) {
+    _remember(_BusEntry(mine: true, did: did, display: displayText));
+  }
+
+  /// Historial en RAM para un contacto puntual: lo que llegó mientras
+  /// el chat estaba cerrado + lo que mandaste vos.
+  List<String> recentFor(String did, String alias) {
+    return _recent
+        .where((e) => e.mine ? e.did == did : (e.display.contains(alias) || e.display.contains(did)))
+        .map((e) => e.display)
+        .toList();
+  }
 
   void start() {
     if (_timer != null) return;
@@ -40,12 +70,21 @@ class MessageBus {
     try {
       final polled = Xionia.pollMessages();
       for (final m in polled) {
-        _controller.add(m.toString());
+        final s = m.toString();
+        _remember(_BusEntry(mine: false, did: null, display: s));
+        _controller.add(s);
       }
     } catch (_) {
       // sin conexión / sin identidad todavía: ignorar este ciclo
     }
   }
+}
+
+class _BusEntry {
+  final bool mine;
+  final String? did; // solo para mensajes propios: a quién se lo mandaste
+  final String display; // texto ya formateado, listo para mostrar
+  _BusEntry({required this.mine, required this.did, required this.display});
 }
 
 void main() => runApp(const XionChatApp());
@@ -83,6 +122,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String? _loadError;
   String _lastFaroAddr = '';
 
+  // Foreground service + notificaciones: mantienen la conexión viva en
+  // background y avisan de mensajes nuevos aunque la app esté cerrada
+  // (no matada del todo, solo en segundo plano).
+  static const _serviceChannel = MethodChannel('com.xionia/service');
+  final _notif = FlutterLocalNotificationsPlugin();
+  StreamSubscription<String>? _notifSub;
+  AppLifecycleState _appState = AppLifecycleState.resumed;
+
   @override
   void initState() {
     super.initState();
@@ -96,6 +143,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _loadError = Xionia.loadError);
       return;
     }
+
+    // Foreground service + permisos: para que Android no mate la red
+    // en background. Si algo de esto falla (permiso denegado, etc.)
+    // no bloquea el resto de la app — sigue andando en foreground.
+    if (Platform.isAndroid) {
+      try {
+        await _serviceChannel.invokeMethod('startService');
+      } catch (_) {}
+      try {
+        if (await Permission.notification.isDenied) {
+          await Permission.notification.request();
+        }
+        if (await Permission.ignoreBatteryOptimizations.isDenied) {
+          await Permission.ignoreBatteryOptimizations.request();
+        }
+      } catch (_) {}
+    }
+    await _initNotifications();
+    _notifSub = MessageBus.instance.stream.listen(_onIncomingForNotification);
+
     final dir = await getApplicationDocumentsDirectory();
     Xionia.setDataDir(dir.path);
     setState(() {
@@ -110,16 +177,52 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     MessageBus.instance.start();
   }
 
+  Future<void> _initNotifications() async {
+    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    try {
+      await _notif.initialize(const InitializationSettings(android: androidSettings));
+    } catch (_) {
+      // sin notificaciones no es fatal, la app sigue funcionando en foreground
+    }
+  }
+
+  void _onIncomingForNotification(String m) {
+    // Solo mientras la app no está en primer plano — si el usuario ya
+    // está mirando el chat, no hace falta molestarlo con una notif.
+    if (_appState == AppLifecycleState.resumed) return;
+    // m viene como "alias: CHAT:texto" — separamos remitente y texto.
+    final idx = m.indexOf(': ');
+    final sender = idx == -1 ? m : m.substring(0, idx);
+    final text = idx == -1 ? '' : m.substring(idx + 2).replaceFirst('CHAT:', '');
+    const androidDetails = AndroidNotificationDetails(
+      'xionia_messages',
+      'Mensajes XionChat',
+      channelDescription: 'Mensajes entrantes cifrados E2E',
+      importance: Importance.high,
+      priority: Priority.high,
+    );
+    _notif.show(
+      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      '💬 $sender',
+      text,
+      const NotificationDetails(android: androidDetails),
+    );
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appState = state;
     if (state == AppLifecycleState.resumed && Xionia.ready && _lastFaroAddr.isNotEmpty) {
       // La app volvió de segundo plano: Android puede haber matado el
       // mapeo NAT del socket UDP mientras estaba en Doze/suspendida.
-      // Reconectamos y forzamos un ANNOUNCE ya mismo en vez de esperar
+      // Reconectamos y forzamos un poll ya mismo en vez de esperar
       // pasivamente al próximo tick del ticker de 15s del lado Go.
-      Xionia.connectFaro(_lastFaroAddr);
-      MessageBus.instance.pollNow();
-      setState(() => faroStatus = Xionia.getFaroAddr());
+      // Usamos la versión async para no congelar la UI en el instante
+      // en que el usuario recién está reabriendo la app.
+      Future(() => Xionia.connectFaro(_lastFaroAddr)).then((_) {
+        MessageBus.instance.pollNow();
+        if (mounted) setState(() => faroStatus = Xionia.getFaroAddr());
+      });
     }
   }
 
@@ -132,31 +235,53 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       context: context,
       builder: (_) {
         final ctrl = TextEditingController(text: '190.220.45.26:54321');
-        return AlertDialog(
-          backgroundColor: const Color(0xFF1F2C34),
-          title: const Text('Conectar al Faro', style: TextStyle(color: Colors.white)),
-          content: TextField(
-            controller: ctrl,
-            style: const TextStyle(color: Colors.white),
-            decoration: const InputDecoration(
-              labelText: 'IP:PUERTO',
-              labelStyle: TextStyle(color: Colors.grey),
-              enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFF128C7E))),
+        bool connecting = false;
+        return StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            backgroundColor: const Color(0xFF1F2C34),
+            title: const Text('Conectar al Faro', style: TextStyle(color: Colors.white)),
+            content: TextField(
+              controller: ctrl,
+              enabled: !connecting,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(
+                labelText: 'IP:PUERTO',
+                labelStyle: TextStyle(color: Colors.grey),
+                enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFF128C7E))),
+              ),
             ),
+            actions: [
+              TextButton(
+                onPressed: connecting ? null : () => Navigator.pop(context),
+                child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+              ),
+              TextButton(
+                onPressed: connecting
+                    ? null
+                    : () async {
+                        setDialogState(() => connecting = true);
+                        final addr = ctrl.text.trim();
+                        // connectFaroAsync corre en otro isolate: no
+                        // congela la UI aunque el faro tarde en
+                        // responder (o esté caído).
+                        final r = Xionia.connectFaro(addr);
+                        _lastFaroAddr = addr;
+                        if (context.mounted) Navigator.pop(context);
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(r), backgroundColor: const Color(0xFF1F2C34)));
+                          setState(() => faroStatus = Xionia.getFaroAddr());
+                        }
+                      },
+                child: connecting
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF25D366)),
+                      )
+                    : const Text('Conectar', style: TextStyle(color: Color(0xFF25D366))),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar', style: TextStyle(color: Colors.grey))),
-            TextButton(
-              onPressed: () {
-                final r = Xionia.connectFaro(ctrl.text);
-                _lastFaroAddr = ctrl.text.trim();
-                Navigator.pop(context);
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(r), backgroundColor: const Color(0xFF1F2C34)));
-                setState(() => faroStatus = Xionia.getFaroAddr());
-              },
-              child: const Text('Conectar', style: TextStyle(color: Color(0xFF25D366))),
-            ),
-          ],
         );
       },
     );
@@ -331,6 +456,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _notifSub?.cancel();
+    // El foreground service NO se detiene acá a propósito: la idea es
+    // que siga vivo mientras la app esté en background, no solo
+    // mientras HomeScreen esté montado.
     super.dispose();
   }
 
@@ -456,7 +585,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    _loadHistoryIfAny();
+    _loadHistory();
     _sub = MessageBus.instance.stream.listen((m) {
       // m viene como "alias: CHAT:eyyy" o "did:maia:...: CHAT:eyyy"
       if (m.contains(widget.alias) || m.contains(widget.did)) {
@@ -467,19 +596,32 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _loadHistoryIfAny() async {
+  Future<void> _loadHistory() async {
+    // 1) si hay historial guardado en disco (grabación estaba ON), lo cargamos primero.
+    var fromFile = <String>[];
     try {
       final f = await _historyFile();
       if (await f.exists()) {
         final data = jsonDecode(await f.readAsString()) as List<dynamic>;
-        setState(() {
-          _recording = true; // si hay historial guardado, asumimos que seguía ON
-          msgs.addAll(data.map((e) => e.toString()));
-        });
-        _scrollToEnd();
+        fromFile = data.map((e) => e.toString()).toList();
+        _recording = true; // si hay historial guardado, asumimos que seguía ON
       }
     } catch (_) {
-      // sin historial o archivo corrupto: arrancamos en blanco, sin drama
+      // sin historial o archivo corrupto: seguimos con lo que haya en RAM
+    }
+
+    // 2) sumamos lo que haya en el buffer en RAM (mensajes que llegaron
+    // o mandaste mientras el chat estaba cerrado en esta misma sesión
+    // de la app) que no esté ya en el archivo, para no duplicar.
+    final fromRam = MessageBus.instance.recentFor(widget.did, widget.alias);
+    final merged = [...fromFile];
+    for (final m in fromRam) {
+      if (!merged.contains(m)) merged.add(m);
+    }
+
+    if (merged.isNotEmpty) {
+      setState(() => msgs.addAll(merged));
+      _scrollToEnd();
     }
   }
 
@@ -526,7 +668,9 @@ class _ChatScreenState extends State<ChatScreen> {
   void _send() {
     if (ctrl.text.isEmpty) return;
     final r = Xionia.sendChat(widget.did, ctrl.text);
-    setState(() => msgs.add('Tú: ${ctrl.text}'));
+    final display = 'Tú: ${ctrl.text}';
+    setState(() => msgs.add(display));
+    MessageBus.instance.addSent(widget.did, display);
     _saveIfRecording();
     ctrl.clear();
     _scrollToEnd();
