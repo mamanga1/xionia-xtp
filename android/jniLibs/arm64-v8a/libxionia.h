@@ -92,6 +92,7 @@ extern char* XioniaListAliases();
 extern char* XioniaConnectFaro(char* addrC);
 extern char* XioniaGetFaroAddr();
 extern char* XioniaSendChat(char* targetC, char* msgC);
+extern char* XioniaSendXTP(char* targetC, char* msgC);
 extern char* XioniaGetMyDID();
 extern char* XioniaGetContactsJSON();
 extern char* XioniaPollMessages();

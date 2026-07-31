@@ -24,6 +24,7 @@ import (
 	"github.com/mr-tron/base58"
 	"xionia-xtp/src/config"
 	"xionia-xtp/src/crypto"
+	"xionia-xtp/src/xtp"
 )
 
 var dataDir string
@@ -63,7 +64,6 @@ func XioniaSetDataDir(path *C.char) {
 }
 
 // ========== MOTOR DE RED ==========
-
 type InnerPayload struct {
 	FromDID string `json:"from"`
 	TS      int64  `json:"ts"`
@@ -74,30 +74,44 @@ type InnerPayload struct {
 type peerKeys struct {
 	DID       string
 	PubKeyEd  []byte
+	PubKeyX   []byte // ← FIX: mismo bug que session.go — sin esto no hay Noise IK posible
 	SharedKey []byte
 }
 
 var (
+	// connMu protege TODO el estado de la conexión activa (globalConn,
+	// globalConnWS, globalUseWS). Se toca desde la goroutine de runNode()
+	// Y desde llamadas FFI disparadas por la UI de Flutter en paralelo,
+	// así que sin este mutex hay una carrera de datos real.
 	connMu       sync.Mutex
 	globalConn   *net.UDPConn
 	globalConnWS *websocket.Conn
 	globalUseWS  bool
 
+	// quitMu protege el ciclo de vida de globalQuit para que Reset() no
+	// pueda hacer close() de un canal ya cerrado (panic).
 	quitMu     sync.Mutex
 	globalQuit = make(chan struct{})
 
 	globalID     *crypto.Identity
 	nodeRunning  bool
 	nodeMu       sync.Mutex
-
 	recvMu       sync.Mutex
 	recvMessages []string
-
 	aclIndexMu   sync.RWMutex
 	globalACLIdx map[[4]byte]peerKeys
-
 	lastPublicIP string
 
+	// XTP: Transport Manager (Fase 2). Se crea una sola vez, dentro de
+	// runNode(), que solo corre una vez por vida de la app (guardado por
+	// nodeMu/nodeRunning). Mismo patrón que shell.go.
+	globalTM *xtp.TransportManager
+
+	// lastActivity: última vez que hubo señal de vida real con el Faro
+	// (mensaje recibido o ANNOUNCE mandado con éxito). Watchdog puramente
+	// en Go, independiente de que algún isolate de Dart esté atento —
+	// si el proceso entero se congela (freezer/Doze agresivo) y luego
+	// se destraba, esto fuerza una reconexión sin depender de nadie más.
 	activityMu   sync.Mutex
 	lastActivity time.Time
 )
@@ -135,6 +149,7 @@ func ensureIdentity() *crypto.Identity {
 
 func connectToFaro(addr string) error {
 	logf("Conectando a: %s", addr)
+
 	connMu.Lock()
 	if globalConn != nil {
 		globalConn.Close()
@@ -146,10 +161,12 @@ func connectToFaro(addr string) error {
 	}
 	connMu.Unlock()
 
+	// 1. UDP primero (default, incluye el propio 443) — con Gate DID.
 	if err := connectUDP(addr); err == nil {
 		return nil
 	}
 
+	// 2. WSS fallback — con Gate DID por headers.
 	if err := connectWS(addr); err == nil {
 		return nil
 	}
@@ -162,21 +179,24 @@ func connectUDP(addr string) error {
 	if myID == nil {
 		return fmt.Errorf("sin identidad")
 	}
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+
+	udpAddr, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
 		return fmt.Errorf("resolviendo UDP: %v", err)
 	}
-	conn, err := net.DialUDP("udp", nil, udpAddr)
+	conn, err := net.DialUDP("udp4", nil, udpAddr)
 	if err != nil {
 		return fmt.Errorf("conectando UDP: %v", err)
 	}
 
+	// Handshake del Gate DID: sin esto el faro descarta todo en silencio.
 	hs, err := crypto.CreateHandshake(myID)
 	if err != nil {
 		conn.Close()
 		return err
 	}
 	conn.Write(hs)
+
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	ack := make([]byte, 1024)
 	n, err := conn.Read(ack)
@@ -189,6 +209,7 @@ func connectUDP(addr string) error {
 		return fmt.Errorf("handshake UDP rechazado")
 	}
 	conn.SetReadDeadline(time.Time{})
+
 	connMu.Lock()
 	globalConn = conn
 	globalUseWS = false
@@ -202,6 +223,7 @@ func connectWS(addr string) error {
 	if myID == nil {
 		return fmt.Errorf("sin identidad")
 	}
+
 	wsHost := addr
 	if !strings.Contains(wsHost, ":") {
 		wsHost += ":443"
@@ -209,18 +231,21 @@ func connectWS(addr string) error {
 	if strings.HasSuffix(wsHost, ":54321") {
 		wsHost = strings.TrimSuffix(wsHost, ":54321") + ":443"
 	}
+
 	nonce := make([]byte, 32)
 	rand.Read(nonce)
 	ts := time.Now().Unix()
 	nonceB64 := base64.StdEncoding.EncodeToString(nonce)
 	msg := fmt.Sprintf("%s|%d|%s", myID.DID, ts, nonceB64)
 	sig := myID.SignMessage([]byte(msg))
+
 	headers := http.Header{}
 	headers.Set("X-Xionia-DID", myID.DID)
 	headers.Set("X-Xionia-Pub", base58.Encode(myID.PubKeyEd))
 	headers.Set("X-Xionia-TS", fmt.Sprintf("%d", ts))
 	headers.Set("X-Xionia-Nonce", nonceB64)
 	headers.Set("X-Xionia-Sig", base64.StdEncoding.EncodeToString(sig))
+
 	wsURL := fmt.Sprintf("wss://%s/ws", wsHost)
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
@@ -230,6 +255,7 @@ func connectWS(addr string) error {
 	if err != nil {
 		return fmt.Errorf("conectando WS: %v", err)
 	}
+
 	connMu.Lock()
 	globalConnWS = ws
 	globalUseWS = true
@@ -244,6 +270,7 @@ func sendToFaro(msg string) error {
 	connWS := globalConnWS
 	conn := globalConn
 	connMu.Unlock()
+
 	if useWS && connWS != nil {
 		return connWS.WriteMessage(websocket.TextMessage, []byte(msg))
 	}
@@ -260,6 +287,7 @@ func readFromFaro() (string, error) {
 	connWS := globalConnWS
 	conn := globalConn
 	connMu.Unlock()
+
 	if useWS && connWS != nil {
 		connWS.SetReadDeadline(time.Now().Add(15 * time.Second))
 		_, msg, err := connWS.ReadMessage()
@@ -319,6 +347,31 @@ func extractPayload(raw string) string {
 	return raw
 }
 
+// XTP: implementa xtp.FaroSender reusando el sendToFaro que ya existe
+// (el mismo socket UDP/WS que usa el resto de mobile.go).
+type faroSenderMobile struct{}
+
+func (f faroSenderMobile) SendToFaro(msg string) error {
+	return sendToFaro(msg)
+}
+
+// buildXTPACLIndex: mismo patrón que shell.go — convierte el índice ACL
+// local (map[[4]byte]peerKeys) al tipo que espera el paquete xtp.
+func buildXTPACLIndex() map[[4]byte]xtp.PeerKeys {
+	aclIndexMu.RLock()
+	defer aclIndexMu.RUnlock()
+	idx := make(map[[4]byte]xtp.PeerKeys, len(globalACLIdx))
+	for kid, pk := range globalACLIdx {
+		idx[kid] = xtp.PeerKeys{
+			DID:       pk.DID,
+			PubKeyEd:  pk.PubKeyEd,
+			PubKeyX:   pk.PubKeyX,
+			SharedKey: pk.SharedKey,
+		}
+	}
+	return idx
+}
+
 func buildACLIndex(myID *crypto.Identity) (map[[4]byte]peerKeys, error) {
 	acl, err := crypto.LoadACL()
 	if err != nil {
@@ -342,7 +395,7 @@ func buildACLIndex(myID *crypto.Identity) (map[[4]byte]peerKeys, error) {
 			continue
 		}
 		kid := crypto.DeriveKeyID(pubX)
-		index[kid] = peerKeys{DID: did, PubKeyEd: pubEd, SharedKey: sharedKey}
+		index[kid] = peerKeys{DID: did, PubKeyEd: pubEd, PubKeyX: pubX, SharedKey: sharedKey}
 	}
 	return index, nil
 }
@@ -362,6 +415,13 @@ func XioniaReloadACL() {
 	globalACLIdx = idx
 	aclIndexMu.Unlock()
 	logf("ReloadACL: %d pares", len(idx))
+
+	// XTP: mantener su copia del ACL sincronizada — si no se hace esto,
+	// un contacto agregado después de crear el TransportManager nunca
+	// va a poder abrir sesión directa, solo relay.
+	if globalTM != nil {
+		globalTM.UpdateACL(buildXTPACLIndex())
+	}
 }
 
 func buildEncryptedPayload(myID *crypto.Identity, sharedKey []byte, inner InnerPayload) (string, error) {
@@ -395,6 +455,10 @@ func sendAnnounce(myID *crypto.Identity) {
 }
 
 func runNode(myID *crypto.Identity, quit chan struct{}) {
+	// Red de seguridad: en una lib cgo un panic sin recuperar en
+	// cualquier goroutine tira abajo el proceso entero de la app
+	// (no solo esta goroutine). Sin esto, un bug de red podría
+	// crashear XionChat en vez de solo reconectar.
 	defer func() {
 		if r := recover(); r != nil {
 			logf("PANIC recuperado en runNode: %v — reintentando en 2s", r)
@@ -408,25 +472,76 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
+	// Carga inicial
 	XioniaReloadACL()
 
-	// Primer ANNOUNCE inmediato
+	// XTP: crear el TransportManager una sola vez. runNode() solo corre
+	// una vez por vida de la app (lo garantiza nodeMu/nodeRunning en
+	// startNodeIfNeeded), así que este es el lugar correcto — mismo
+	// patrón que runInteractiveShell() en shell.go.
+	globalTM = xtp.NewTransportManager(
+		myID,
+		faroSenderMobile{},
+		buildXTPACLIndex(),
+		xtp.ManagerCallbacks{
+			// OnMessage empuja al MISMO buffer que ya consume
+			// XioniaPollMessages() — Flutter no necesita cambiar nada,
+			// los mensajes que lleguen por directo (Noise IK) o por
+			// relay entran por el mismo caño hacia la UI.
+			OnMessage: func(peerDID, displayName, command string) {
+				fullMsg := fmt.Sprintf("%s: %s", displayName, command)
+				recvMu.Lock()
+				recvMessages = append(recvMessages, fullMsg)
+				if len(recvMessages) > 200 {
+					recvMessages = recvMessages[len(recvMessages)-200:]
+				}
+				recvMu.Unlock()
+				logf("[XTP MSG %s]: %s", peerDID, command)
+			},
+			OnDirectSessionActive: func(peerDID string) {
+				logf("[XTP] sesión directa activa con %s", peerDID)
+			},
+			OnDirectSessionLost: func(peerDID string) {
+				logf("[XTP] sesión directa perdida con %s", peerDID)
+			},
+			OnFallbackToRelay: func(peerDID string) {
+				logf("[XTP] fallback a relay con %s (hole punching falló)", peerDID)
+			},
+			OnStateChange: func(from, to xtp.State, event xtp.Event) {
+				logf("[XTP] FSM: %s -> %s (%s)", from, to, event)
+			},
+			OnError: func(context string, err error) {
+				logf("[XTP] error en %s: %v", context, err)
+			},
+		},
+		xtp.DefaultManagerConfig(),
+	)
+	// El faro ya está conectado a esta altura (connectToFaro corrió antes
+	// de que startNodeIfNeeded() dispare este runNode), así que avisamos
+	// a la FSM de una: mismo orden que shell.go.
+	globalTM.FSM().Send(xtp.EvConnectFaro, nil)
+	globalTM.FSM().Send(xtp.EvFaroConnected, nil)
+	globalTM.FSM().Send(xtp.EvAnnounceSent, nil)
+
+	// Primer ANNOUNCE inmediato (no esperar el ticker) para re-punchear
+	// el NAT lo antes posible al conectar/reconectar.
 	sendAnnounce(myID)
 
-	// ← CAMBIO: retry rápido a los 3s (fix "hay que saludarse")
+	// Retry a los 3s: el primer ANNOUNCE a veces sale antes de que el
+	// faro termine de procesar el handshake del Gate ("hay que
+	// saludarse dos veces"). Mismo fix que shell.go.
 	go func() {
 		select {
 		case <-quit:
 			return
 		case <-time.After(3 * time.Second):
 			sendAnnounce(myID)
-			logf("ANNOUNCE retry (3s) enviado")
 		}
 	}()
 
-	// ← CAMBIO: ANNOUNCE cada 10s (era 15s)
+	// ANNOUNCE cada 10s
 	go func() {
-		ticker := time.NewTicker(10 * time.Second) // ← CAMBIO: era 15s
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -438,16 +553,21 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
-	// ← CAMBIO: Watchdog cada 10s, reconecta si >20s sin actividad (era 20s/40s)
+	// Watchdog: si pasan 20s sin ninguna señal de vida (ni recibimos
+	// nada del Faro ni logramos mandar un ANNOUNCE), fuerza reconexión
+	// ya mismo. No depende de que el read loop haga timeout por su
+	// cuenta (eso tarda hasta 15s por ciclo) ni de que algún isolate de
+	// Dart esté atento — es puramente Go, sobrevive a que el proceso se
+	// haya congelado y recién ahora vuelva a correr.
 	go func() {
-		ticker := time.NewTicker(10 * time.Second) // ← CAMBIO: era 20s
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-quit:
 				return
 			case <-ticker.C:
-				if stale := staleSince(); stale > 20*time.Second { // ← CAMBIO: era 40s
+				if stale := staleSince(); stale > 20*time.Second {
 					logf("[WATCHDOG] sin actividad hace %v, forzando reconexion", stale)
 					connMu.Lock()
 					if globalConn != nil {
@@ -463,6 +583,11 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 					if addr != "" {
 						if err := connectToFaro(addr); err == nil {
 							sendAnnounce(myID)
+							if globalTM != nil {
+								globalTM.FSM().Send(xtp.EvFaroConnected, nil)
+								globalTM.FSM().Send(xtp.EvAnnounceSent, nil)
+							}
+							logf("[WATCHDOG] reconectado y ANNOUNCE enviado")
 						} else {
 							logf("[WATCHDOG] reconexion fallo: %v", err)
 						}
@@ -472,13 +597,14 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
-	// Listener principal
+	// Listener principal (con reconexión como shell.go)
 	for {
 		select {
 		case <-quit:
 			return
 		default:
 		}
+
 		raw, err := readFromFaro()
 		if err != nil {
 			select {
@@ -486,6 +612,7 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 				return
 			default:
 			}
+			// Socket roto o timeout: reconectar
 			connMu.Lock()
 			if !globalUseWS && globalConn != nil {
 				globalConn.Close()
@@ -503,10 +630,22 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 			}
 			continue
 		}
+
+		// Cualquier paquete recibido, sea lo que sea, prueba que el
+		// camino de red funciona — alimenta al watchdog.
 		touchActivity()
+
 		raw = stripPadding(raw)
 		raw = extractPayload(raw)
 
+		// XTP: rutear al TransportManager (signaling de sesión directa
+		// o mensaje por relay ya envuelto). Mismo orden que shell.go:
+		// después de stripPadding/extractPayload, antes de ACK_IP.
+		if globalTM != nil && globalTM.HandleIncoming(raw) {
+			continue
+		}
+
+		// ACK_IP: roaming
 		if strings.HasPrefix(raw, "ACK_IP ") {
 			parts := strings.SplitN(raw, " ", 2)
 			if len(parts) == 2 {
@@ -522,26 +661,32 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 			}
 			continue
 		}
+
 		if strings.HasPrefix(raw, "ACK") {
 			continue
 		}
+
 		parts := strings.SplitN(raw, "|", 2)
 		if len(parts) != 2 {
 			continue
 		}
+
 		kidBytes, err := hex.DecodeString(parts[0])
 		if err != nil || len(kidBytes) != 4 {
 			continue
 		}
 		var kid [4]byte
 		copy(kid[:], kidBytes)
+
 		aclIndexMu.RLock()
 		peer, exists := globalACLIdx[kid]
 		aclIndexMu.RUnlock()
+
 		if !exists {
 			logf("[NODO] Peer KID %x no encontrado en ACL", kid)
 			continue
 		}
+
 		ciphertext, err := base64.StdEncoding.DecodeString(parts[1])
 		if err != nil {
 			continue
@@ -551,10 +696,12 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 			logf("[NODO] Decrypt fail from %s: %v", peer.DID, err)
 			continue
 		}
+
 		var inner InnerPayload
 		if json.Unmarshal(plaintext, &inner) != nil {
 			continue
 		}
+
 		innerForVerify := inner
 		innerForVerify.Sig = ""
 		verifyJSON, _ := json.Marshal(innerForVerify)
@@ -566,14 +713,17 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		if time.Now().Unix()-inner.TS > 60 {
 			continue
 		}
+
 		displayName := crypto.ResolveDID(peer.DID)
 		fullMsg := fmt.Sprintf("%s: %s", displayName, inner.Cmd)
+
 		recvMu.Lock()
 		recvMessages = append(recvMessages, fullMsg)
 		if len(recvMessages) > 200 {
 			recvMessages = recvMessages[len(recvMessages)-200:]
 		}
 		recvMu.Unlock()
+
 		logf("[MSG %s]: %s", peer.DID, inner.Cmd)
 	}
 }
@@ -618,9 +768,11 @@ func startNodeIfNeeded() {
 		return
 	}
 	nodeRunning = true
+
 	quitMu.Lock()
 	quit := globalQuit
 	quitMu.Unlock()
+
 	go runNode(id, quit)
 }
 
@@ -635,6 +787,12 @@ func XioniaReset() {
 	quitMu.Unlock()
 	nodeRunning = false
 	nodeMu.Unlock()
+
+	if globalTM != nil {
+		globalTM.Close()
+		globalTM = nil
+	}
+
 	connMu.Lock()
 	if globalConn != nil {
 		globalConn.Close()
@@ -645,6 +803,7 @@ func XioniaReset() {
 		globalConnWS = nil
 	}
 	connMu.Unlock()
+
 	inDataDir(func() {
 		crypto.ClearACL()
 		if aliases, err := crypto.LoadAliases(); err == nil {
@@ -762,14 +921,22 @@ func XioniaListAliases() *C.char {
 func XioniaConnectFaro(addrC *C.char) *C.char {
 	addr := C.GoString(addrC)
 	logf("ConnectFaro: %s", addr)
+
 	inDataDir(func() {
 		_ = config.SetFaroAddr(addr)
 	})
+
 	if err := connectToFaro(addr); err != nil {
 		logf("ConnectFaro ERROR: %v", err)
 		return C.CString("ERROR: " + err.Error())
 	}
+
 	startNodeIfNeeded()
+
+	// Si el nodo ya estaba corriendo (ej: la app vuelve de background y
+	// Flutter llama ConnectFaro de nuevo para forzar reconexión), el
+	// socket se reabrió arriba pero el goroutine de announce sigue con
+	// su propio timer de 15s. Mandamos uno ya mismo para no esperar.
 	if id := ensureIdentity(); id != nil {
 		go sendAnnounce(id)
 	}
@@ -782,6 +949,7 @@ func XioniaGetFaroAddr() *C.char {
 	hasWS := globalConnWS != nil
 	hasUDP := globalConn != nil
 	connMu.Unlock()
+
 	if hasWS {
 		return C.CString(config.GetFaroAddr() + " (WS)")
 	}
@@ -791,20 +959,43 @@ func XioniaGetFaroAddr() *C.char {
 	return C.CString(config.GetFaroAddr() + " (off)")
 }
 
-//export XioniaSendChat
-func XioniaSendChat(targetC, msgC *C.char) *C.char {
-	target := C.GoString(targetC)
-	msg := C.GoString(msgC)
+// sendChatCommon: usado tanto por XioniaSendChat como por XioniaSendXTP.
+// Si el TransportManager ya está armado, lo usa (elige directo Noise IK
+// o relay automáticamente); si no, cae al camino legacy de siempre.
+func sendChatCommon(target, msg string) string {
 	id := ensureIdentity()
 	if id == nil {
-		return C.CString("ERROR: sin identidad")
+		return "ERROR: sin identidad"
 	}
+
 	targetDID, _ := crypto.ResolveNode(target)
 	if targetDID == "" {
 		targetDID = target
 	}
-	result := ExecuteRealCommand(id, targetDID, "CHAT:"+msg)
-	return C.CString(result)
+
+	if globalTM != nil {
+		transport, err := globalTM.Send(targetDID, "CHAT:"+msg)
+		if err != nil {
+			return fmt.Sprintf("❌ Error XTP: %v", err)
+		}
+		return fmt.Sprintf("📤 Enviado (%s)", transport)
+	}
+
+	return ExecuteRealCommand(id, targetDID, "CHAT:"+msg)
+}
+
+//export XioniaSendChat
+func XioniaSendChat(targetC, msgC *C.char) *C.char {
+	target := C.GoString(targetC)
+	msg := C.GoString(msgC)
+	return C.CString(sendChatCommon(target, msg))
+}
+
+//export XioniaSendXTP
+func XioniaSendXTP(targetC, msgC *C.char) *C.char {
+	target := C.GoString(targetC)
+	msg := C.GoString(msgC)
+	return C.CString(sendChatCommon(target, msg))
 }
 
 //export XioniaGetMyDID
