@@ -12,6 +12,7 @@ import (
 // ============================================================================
 // SESSION MANAGER
 // ============================================================================
+//
 // Maneja el ciclo de vida de una sesión Noise IK entre dos nodos:
 //
 //   1. Creación: NewSession(initiator, myIdentity, peerPubX)
@@ -135,8 +136,8 @@ func NewSession(isInitiator bool, myIdentity *crypto.Identity, peerDID string, p
 // o a través del faro (relay fallback).
 //
 // Flujo del patrón IK (2 mensajes):
-//   1. Iniciador → Respondedor: e, es, s, ss  (este método)
-//   2. Respondedor → Iniciador: e, ee, se     (HandleMessage del iniciador)
+//  1. Iniciador → Respondedor: e, es, s, ss  (este método)
+//  2. Respondedor → Iniciador: e, ee, se     (HandleMessage del iniciador)
 func (s *Session) InitiatorMessage() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -193,16 +194,29 @@ func (s *Session) HandleMessage(msg []byte) (response []byte, completed bool, er
 		if err != nil {
 			return nil, false, fmt.Errorf("leyendo handshake (iniciador): %w", err)
 		}
+
 		if done {
 			s.state = SessionActive
 			s.activatedAt = time.Now()
 			s.lastRekeyAt = time.Now()
 			s.sendCount = 0
 			s.recvCount = 0
+
+			// FIX D: recover() en goroutine de onActivate
 			if s.onActivate != nil {
-				go s.onActivate(s.peerDID)
+				peerDID := s.peerDID
+				cb := s.onActivate
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							Debugf("[XTP] ⚠️ Panic en onActivate (iniciador): %v\n", r)
+						}
+					}()
+					cb(peerDID)
+				}()
 			}
 		}
+
 		return nil, done, nil
 	}
 
@@ -226,8 +240,19 @@ func (s *Session) HandleMessage(msg []byte) (response []byte, completed bool, er
 		s.lastRekeyAt = time.Now()
 		s.sendCount = 0
 		s.recvCount = 0
+
+		// FIX D: recover() en goroutine de onActivate
 		if s.onActivate != nil {
-			go s.onActivate(s.peerDID)
+			peerDID := s.peerDID
+			cb := s.onActivate
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						Debugf("[XTP] ⚠️ Panic en onActivate (respondedor): %v\n", r)
+					}
+				}()
+				cb(peerDID)
+			}()
 		}
 	}
 
@@ -291,13 +316,17 @@ func (s *Session) maybeRekeyLocked() {
 	}
 
 	if needRekey {
+		// FIX: capturar total ANTES de resetear (antes imprimía siempre 0)
+		total := s.sendCount + s.recvCount
+		uptime := time.Since(s.activatedAt).Round(time.Second)
+
 		s.noise.Rekey()
 		s.lastRekeyAt = time.Now()
 		s.sendCount = 0
 		s.recvCount = 0
-		fmt.Printf("[XTP] 🔑 Rekey con %s (después de %d msg / %s)\n",
-			s.peerDID[:20]+"...", s.sendCount+s.recvCount,
-			time.Since(s.activatedAt).Round(time.Second))
+
+		Debugf("[XTP] 🔑 Rekey con %s (después de %d msg / %s)\n",
+			s.peerDID[:20]+"...", total, uptime)
 	}
 }
 
@@ -366,12 +395,23 @@ func (s *Session) Close() {
 	if s.state == SessionClosed {
 		return
 	}
-
 	s.state = SessionClosed
+
+	// FIX D: recover() en goroutine de onClose
 	if s.onClose != nil {
-		go s.onClose(s.peerDID)
+		peerDID := s.peerDID
+		cb := s.onClose
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Debugf("[XTP] ⚠️ Panic en onClose: %v\n", r)
+				}
+			}()
+			cb(peerDID)
+		}()
 	}
-	fmt.Printf("[XTP] 🔒 Sesión cerrada con %s\n", s.peerDID[:20]+"...")
+
+	Debugf("[XTP] 🔒 Sesión cerrada con %s\n", s.peerDID[:20]+"...")
 }
 
 // OnActivate registra un callback que se llama cuando la sesión se activa.

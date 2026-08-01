@@ -207,23 +207,23 @@ var transitionTable = map[transitionKey]State{
 	{Offline, EvConnectFaro}: Connecting,
 
 	// Connecting → Registered (faro conectado + ANNOUNCE confirmado)
-	{Connecting, EvFaroConnected}:  Registered,
+	{Connecting, EvFaroConnected}:    Registered,
 	{Connecting, EvFaroDisconnected}: Offline,
-	{Connecting, EvError}:          Offline,
+	{Connecting, EvError}:            Offline,
 
 	// Registered → Discovering (buscar peer)
-	{Registered, EvDiscoverPeer}: Discovering,
+	{Registered, EvDiscoverPeer}:     Discovering,
 	{Registered, EvFaroDisconnected}: Offline,
 
 	// Discovering → Punching (peer encontrado, iniciar hole punching)
-	{Discovering, EvPeerFound}:    Punching,
-	{Discovering, EvPeerNotFound}: Registered, // Peer no está, volver a Registered
+	{Discovering, EvPeerFound}:        Punching,
+	{Discovering, EvPeerNotFound}:     Registered, // Peer no está, volver a Registered
 	{Discovering, EvFaroDisconnected}: Offline,
 
 	// Punching → NoiseHandshake (hole punching funcionó)
 	{Punching, EvPunchComplete}: NoiseHandshake,
 	// Punching → RelayFallback (hole punching falló)
-	{Punching, EvPunchFailed}:   RelayFallback,
+	{Punching, EvPunchFailed}:      RelayFallback,
 	{Punching, EvFaroDisconnected}: Offline,
 
 	// NoiseHandshake → Direct (Noise IK completado)
@@ -237,7 +237,7 @@ var transitionTable = map[transitionKey]State{
 	{Direct, EvError}:         RelayFallback,
 
 	// Keepalive → Direct (keepalive respondido, volver a Direct)
-	{Keepalive, EvKeepaliveTick}:    Direct,
+	{Keepalive, EvKeepaliveTick}: Direct,
 	// Keepalive → Closed (peer no respondió, sesión muerta)
 	{Keepalive, EvKeepaliveTimeout}: Closed,
 	{Keepalive, EvCloseSession}:     Closed,
@@ -245,15 +245,15 @@ var transitionTable = map[transitionKey]State{
 	// RelayFallback → Discovering (reintentar hole punching)
 	{RelayFallback, EvDiscoverPeer}: Discovering,
 	// RelayFallback → Closed (cerrar sesión)
-	{RelayFallback, EvCloseSession}: Closed,
+	{RelayFallback, EvCloseSession}:     Closed,
 	{RelayFallback, EvFaroDisconnected}: Offline,
 
 	// Cualquier estado → Closed (cerrar)
-	{Offline, EvCloseSession}:     Closed,
-	{Connecting, EvCloseSession}:  Closed,
-	{Registered, EvCloseSession}:  Closed,
-	{Discovering, EvCloseSession}: Closed,
-	{Punching, EvCloseSession}:    Closed,
+	{Offline, EvCloseSession}:        Closed,
+	{Connecting, EvCloseSession}:     Closed,
+	{Registered, EvCloseSession}:     Closed,
+	{Discovering, EvCloseSession}:    Closed,
+	{Punching, EvCloseSession}:       Closed,
 	{NoiseHandshake, EvCloseSession}: Closed,
 }
 
@@ -365,7 +365,7 @@ func (f *FSM) Send(event Event, meta map[string]interface{}) bool {
 		f.mu.Unlock()
 		// Transición inválida: loguear y ignorar (no es un error fatal,
 		// puede ser un evento duplicado o fuera de orden).
-		fmt.Printf("[FSM] ⚠️ Transición inválida: %s + %s (ignorada)\n", from, event)
+		Debugf("[FSM] ⚠️ Transición inválida: %s + %s (ignorada)\n", from, event)
 		return false
 	}
 
@@ -397,7 +397,7 @@ func (f *FSM) Send(event Event, meta map[string]interface{}) bool {
 		enterCb(from, to, event, meta)
 	}
 
-	fmt.Printf("[FSM] %s → %s (%s)\n", from, to, event)
+	Debugf("[FSM] %s → %s (%s)\n", from, to, event)
 	return true
 }
 
@@ -446,7 +446,7 @@ func (f *FSM) Reset() {
 	f.peerDID = ""
 	f.enteredAt = time.Now()
 	f.mu.Unlock()
-	fmt.Printf("[FSM] %s → OFFLINE (reset)\n", from)
+	Debugf("[FSM] %s → OFFLINE (reset)\n", from)
 }
 
 // ElapsedInState devuelve cuánto tiempo lleva en el estado actual.
@@ -462,4 +462,14 @@ func (f *FSM) String() string {
 	defer f.mu.RUnlock()
 	return fmt.Sprintf("FSM{state=%s, peer=%s, faro=%s, elapsed=%s}",
 		f.current, f.peerDID, f.faroAddr, time.Since(f.enteredAt).Round(time.Second))
+}
+
+// DebugMode controla la visibilidad de los logs internos de XTP.
+var DebugMode bool
+
+// Debugf imprime solo si DebugMode está activo.
+func Debugf(format string, args ...interface{}) {
+	if DebugMode {
+		fmt.Printf(format, args...)
+	}
 }

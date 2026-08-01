@@ -248,7 +248,7 @@ func connectWS(addr string) error {
 
 	wsURL := fmt.Sprintf("wss://%s/ws", wsHost)
 	dialer := websocket.Dialer{
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: os.Getenv("XION_INSECURE_WS") == "1"},
 		HandshakeTimeout: 5 * time.Second,
 	}
 	ws, _, err := dialer.Dial(wsURL, headers)
@@ -308,14 +308,11 @@ func readFromFaro() (string, error) {
 func addPadding(payload string) string {
 	size := 50 + int(time.Now().UnixNano()%150)
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	randBuf := make([]byte, size)
+	rand.Read(randBuf)
 	padding := make([]byte, size)
 	for i := range padding {
-		randBuf := make([]byte, 1)
-		if _, err := rand.Read(randBuf); err != nil {
-			padding[i] = charset[0]
-			continue
-		}
-		padding[i] = charset[int(randBuf[0])%len(charset)]
+		padding[i] = charset[int(randBuf[i])%len(charset)]
 	}
 	return fmt.Sprintf("%s|%s", payload, string(padding))
 }
@@ -489,6 +486,61 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 			// los mensajes que lleguen por directo (Noise IK) o por
 			// relay entran por el mismo caño hacia la UI.
 			OnMessage: func(peerDID, displayName, command string) {
+				// Procesar comandos de grupo (no mostrar como chat)
+				if strings.HasPrefix(command, "GROUP_SYNC:") {
+					parts := strings.SplitN(command, ":", 3)
+					if len(parts) == 3 {
+						alias := parts[1]
+						var group crypto.Group
+						if json.Unmarshal([]byte(parts[2]), &group) == nil {
+							if group.Admin != peerDID {
+								logf("[XTP] GROUP_SYNC rechazado: %s no es admin", peerDID)
+							} else {
+								crypto.SaveGroupDirect(alias, &group)
+								logf("[XTP] Grupo '%s' sincronizado (%d miembros)", alias, len(group.Members))
+							}
+						}
+					}
+					return
+				}
+				if strings.HasPrefix(command, "GROUP_DELETE:") {
+					parts := strings.SplitN(command, ":", 2)
+					if len(parts) == 2 {
+						crypto.DeleteGroup(parts[1])
+						logf("[XTP] Grupo '%s' eliminado por admin", parts[1])
+					}
+					return
+				}
+				if strings.HasPrefix(command, "GROUP_KICKED:") {
+					parts := strings.SplitN(command, ":", 2)
+					if len(parts) == 2 {
+						crypto.RemoveMember(parts[1], myID.DID)
+						logf("[XTP] Expulsado del grupo '%s'", parts[1])
+					}
+					return
+				}
+				if strings.HasPrefix(command, "GROUP_LEAVE:") {
+					parts := strings.SplitN(command, ":", 3)
+					if len(parts) == 3 {
+						crypto.RemoveMember(parts[1], parts[2])
+						logf("[XTP] %s salió del grupo '%s'", parts[2], parts[1])
+					}
+					return
+				}
+				if strings.HasPrefix(command, "GROUP:") {
+					parts := strings.SplitN(command, ":", 3)
+					if len(parts) == 3 {
+						fullMsg := fmt.Sprintf("[GRUPO:%s] %s: %s", parts[1], displayName, parts[2])
+						recvMu.Lock()
+						recvMessages = append(recvMessages, fullMsg)
+						if len(recvMessages) > 200 {
+							recvMessages = recvMessages[len(recvMessages)-200:]
+						}
+						recvMu.Unlock()
+						return
+					}
+				}
+
 				fullMsg := fmt.Sprintf("%s: %s", displayName, command)
 				recvMu.Lock()
 				recvMessages = append(recvMessages, fullMsg)

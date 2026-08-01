@@ -23,17 +23,15 @@ type TransportManager struct {
 	identity *crypto.Identity
 	faro     FaroSender
 	fsm      *FSM
-
-	relay  *RelayTransport
-	direct map[string]*DirectTransport
+	relay    *RelayTransport
+	direct   map[string]*DirectTransport
 
 	aclIndex map[[4]byte]PeerKeys
 	aclByDID map[string]PeerKeys
 
 	cb ManagerCallbacks
 
-	closed bool
-
+	closed     bool
 	autoDirect bool
 }
 
@@ -73,6 +71,7 @@ func NewTransportManager(
 			}
 		},
 	}
+
 	relay := NewRelayTransport(identity, faro, aclIndex, relayCb)
 
 	tm := &TransportManager{
@@ -92,6 +91,7 @@ func NewTransportManager(
 			cb.OnStateChange(from, to, event)
 		}
 	})
+
 	fsm.OnEnter(RelayFallback, func(from, to State, event Event, meta map[string]interface{}) {
 		if cb.OnStateChange != nil {
 			cb.OnStateChange(from, to, event)
@@ -124,7 +124,6 @@ func (tm *TransportManager) Send(peerDID string, command string) (transport stri
 	if autoDirect && !hasDirect {
 		peer, hasPeer := tm.getPeerKeys(peerDID)
 		if hasPeer {
-			// ← FIX: Usar PubKeyX (X25519), NO PubKeyEd (Ed25519)
 			if len(peer.PubKeyX) != 32 {
 				if tm.cb.OnError != nil {
 					tm.cb.OnError("xtp:"+peerDID[:15], fmt.Errorf("peer sin PubKeyX válida (len=%d)", len(peer.PubKeyX)))
@@ -132,8 +131,15 @@ func (tm *TransportManager) Send(peerDID string, command string) (transport stri
 			} else {
 				peerPubX := new([32]byte)
 				copy(peerPubX[:], peer.PubKeyX[:32])
-
-				go tm.tryDirectSession(peerDID, peerPubX)
+				// FIX Claude D: recover() en goroutine de tryDirectSession
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							Debugf("[XTP-MGR] ⚠️ Panic en tryDirectSession: %v\n", r)
+						}
+					}()
+					tm.tryDirectSession(peerDID, peerPubX)
+				}()
 			}
 
 			if err := tm.relay.Send(peerDID, command); err != nil {
@@ -162,10 +168,10 @@ func (tm *TransportManager) tryDirectSession(peerDID string, peerPubX *[32]byte)
 
 	dtCb := DirectCallbacks{
 		OnPunchComplete: func(peerDID string, peerAddr *net.UDPAddr) {
-			fmt.Printf("[XTP-MGR] 👊 Hole punching exitoso con %s\n", peerDID[:20]+"...")
+			Debugf("[XTP-MGR] 👊 Hole punching exitoso con %s\n", peerDID[:20]+"...")
 		},
 		OnSessionActive: func(peerDID string) {
-			fmt.Printf("[XTP-MGR] 🔐 Sesión directa activa con %s\n", peerDID[:20]+"...")
+			Debugf("[XTP-MGR] 🔐 Sesión directa activa con %s\n", peerDID[:20]+"...")
 			if tm.cb.OnDirectSessionActive != nil {
 				tm.cb.OnDirectSessionActive(peerDID)
 			}
@@ -177,7 +183,7 @@ func (tm *TransportManager) tryDirectSession(peerDID string, peerPubX *[32]byte)
 			}
 		},
 		OnSessionLost: func(peerDID string) {
-			fmt.Printf("[XTP-MGR] 💀 Sesión directa perdida con %s\n", peerDID[:20]+"...")
+			Debugf("[XTP-MGR] 💀 Sesión directa perdida con %s\n", peerDID[:20]+"...")
 			if tm.cb.OnDirectSessionLost != nil {
 				tm.cb.OnDirectSessionLost(peerDID)
 			}
@@ -186,7 +192,7 @@ func (tm *TransportManager) tryDirectSession(peerDID string, peerPubX *[32]byte)
 			tm.mu.Unlock()
 		},
 		OnFallbackToRelay: func(peerDID string) {
-			fmt.Printf("[XTP-MGR] 🔄 Fallback a relay con %s\n", peerDID[:20]+"...")
+			Debugf("[XTP-MGR] 🔄 Fallback a relay con %s\n", peerDID[:20]+"...")
 			if tm.cb.OnFallbackToRelay != nil {
 				tm.cb.OnFallbackToRelay(peerDID)
 			}
@@ -201,13 +207,27 @@ func (tm *TransportManager) tryDirectSession(peerDID string, peerPubX *[32]byte)
 		},
 	}
 
-	dt := NewDirectTransport(tm.identity.DID, tm.fsm, tm.faro, dtCb)
+	// FIX B: FSM por-sesión, sembrada en Registered
+	sessionFSM := NewFSM()
+	sessionFSM.Send(EvConnectFaro, nil)
+	sessionFSM.Send(EvFaroConnected, nil)
+	sessionFSM.Send(EvAnnounceSent, nil)
+
+	dt := NewDirectTransport(tm.identity.DID, sessionFSM, tm.faro, dtCb)
 	dt.SetIdentity(tm.identity)
+
+	// FIX A hardening: sembrar expectedPeerPubX
+	if peer, ok := tm.aclByDID[peerDID]; ok && len(peer.PubKeyX) == 32 {
+		pubX := new([32]byte)
+		copy(pubX[:], peer.PubKeyX[:32])
+		dt.SetExpectedPeerPubX(pubX)
+	}
+
 	tm.direct[peerDID] = dt
 	tm.mu.Unlock()
 
 	if err := dt.OpenSession(peerDID, peerPubX); err != nil {
-		fmt.Printf("[XTP-MGR] ❌ Sesión directa falló con %s: %v\n", peerDID[:20]+"...", err)
+		Debugf("[XTP-MGR] ❌ Sesión directa falló con %s: %v\n", peerDID[:20]+"...", err)
 		tm.mu.Lock()
 		delete(tm.direct, peerDID)
 		tm.mu.Unlock()
@@ -225,7 +245,6 @@ func (tm *TransportManager) HandleIncoming(raw string) bool {
 	if tm.isFaroSignal(raw) {
 		return tm.handleFaroSignal(raw)
 	}
-
 	return tm.relay.HandleIncoming(raw)
 }
 
@@ -268,6 +287,15 @@ func (tm *TransportManager) handleFaroSignal(raw string) bool {
 		}
 		senderDID := parts[1]
 
+		// FIX A: Rechazar desconocidos que no están en el ACL
+		tm.mu.RLock()
+		_, inACL := tm.aclByDID[senderDID]
+		tm.mu.RUnlock()
+		if !inACL {
+			Debugf("[XTP-MGR] ⚠️ SESSION_INCOMING rechazado: %s no está en ACL\n", senderDID[:20]+"...")
+			return true
+		}
+
 		tm.mu.Lock()
 		dt, exists := tm.direct[senderDID]
 		if !exists {
@@ -305,8 +333,23 @@ func (tm *TransportManager) handleFaroSignal(raw string) bool {
 					tm.mu.Unlock()
 				},
 			}
-			dt = NewDirectTransport(tm.identity.DID, tm.fsm, tm.faro, dtCb)
+
+			// FIX B: FSM por-sesión, sembrada en Registered
+			sessionFSM := NewFSM()
+			sessionFSM.Send(EvConnectFaro, nil)
+			sessionFSM.Send(EvFaroConnected, nil)
+			sessionFSM.Send(EvAnnounceSent, nil)
+
+			dt = NewDirectTransport(tm.identity.DID, sessionFSM, tm.faro, dtCb)
 			dt.SetIdentity(tm.identity)
+
+			// FIX A hardening: sembrar expectedPeerPubX
+			if peer, ok := tm.aclByDID[senderDID]; ok && len(peer.PubKeyX) == 32 {
+				pubX := new([32]byte)
+				copy(pubX[:], peer.PubKeyX[:32])
+				dt.SetExpectedPeerPubX(pubX)
+			}
+
 			tm.direct[senderDID] = dt
 		}
 		tm.mu.Unlock()
@@ -339,7 +382,6 @@ func (tm *TransportManager) handleFaroSignal(raw string) bool {
 		}
 		return true
 	}
-
 	return false
 }
 
@@ -411,8 +453,7 @@ func (tm *TransportManager) Close() {
 	}
 
 	tm.relay.Close()
-
-	fmt.Printf("[XTP-MGR] 🔒 TransportManager cerrado\n")
+	Debugf("[XTP-MGR] 🔒 TransportManager cerrado\n")
 }
 
 func (tm *TransportManager) getPeerKeys(peerDID string) (PeerKeys, bool) {

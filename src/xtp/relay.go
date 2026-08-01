@@ -39,11 +39,9 @@ type RelayTransport struct {
 
 	identity *crypto.Identity
 	faro     FaroSender
-
 	aclIndex map[[4]byte]PeerKeys
 	aclByDID map[string]PeerKeys
-
-	cb RelayCallbacks
+	cb       RelayCallbacks
 
 	closed bool
 
@@ -62,7 +60,6 @@ func NewRelayTransport(identity *crypto.Identity, faro FaroSender, aclIndex map[
 	for _, pk := range aclIndex {
 		aclByDID[pk.DID] = pk
 	}
-
 	return &RelayTransport{
 		identity:     identity,
 		faro:         faro,
@@ -83,7 +80,6 @@ func (rt *RelayTransport) Send(peerDID string, command string) error {
 	rt.mu.RUnlock()
 
 	if !exists {
-		// FIX: no paniquear si peerDID tiene menos de 20 caracteres
 		if len(peerDID) > 20 {
 			return fmt.Errorf("peer %s no está en el ACL", peerDID[:20]+"...")
 		}
@@ -112,14 +108,12 @@ func (rt *RelayTransport) Send(peerDID string, command string) error {
 		hex.EncodeToString(kid[:]),
 		base64.StdEncoding.EncodeToString(ciphertext),
 	)
-
 	payload = addRelayPadding(payload)
 
 	relayMsg := fmt.Sprintf("RELAY %s %s %s", peerDID, rt.identity.DID, payload)
 	if err := rt.faro.SendToFaro(relayMsg); err != nil {
 		return fmt.Errorf("enviando RELAY al faro: %w", err)
 	}
-
 	return nil
 }
 
@@ -141,7 +135,6 @@ func (rt *RelayTransport) HandleIncoming(raw string) bool {
 	if err != nil || len(kidBytes) != 4 {
 		return false
 	}
-
 	var kid [4]byte
 	copy(kid[:], kidBytes)
 
@@ -175,7 +168,6 @@ func (rt *RelayTransport) HandleIncoming(raw string) bool {
 	if err != nil {
 		return false
 	}
-
 	if !crypto.VerifyMessage(peer.PubKeyEd, verifyJSON, sigBytes) {
 		if rt.cb.OnError != nil {
 			rt.cb.OnError(peer.DID, fmt.Errorf("firma inválida"))
@@ -203,7 +195,6 @@ func (rt *RelayTransport) HandleIncoming(raw string) bool {
 	case rt.incomingChan <- msg:
 	default:
 	}
-
 	return true
 }
 
@@ -221,7 +212,6 @@ func (rt *RelayTransport) UpdateACL(aclIndex map[[4]byte]PeerKeys) {
 	for _, pk := range aclIndex {
 		aclByDID[pk.DID] = pk
 	}
-
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.aclIndex = aclIndex
@@ -240,18 +230,21 @@ func (rt *RelayTransport) Close() {
 	rt.closed = true
 }
 
+// FIX 15: una sola llamada a rand.Read en vez de una por byte.
+// Antes hacía N syscalls (uno por cada byte de padding).
 func addRelayPadding(payload string) string {
 	randSize := make([]byte, 1)
 	rand.Read(randSize)
 	size := 50 + int(randSize[0])%151
 
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+	randBuf := make([]byte, size)
+	rand.Read(randBuf)
+
 	padding := make([]byte, size)
 	for i := range padding {
-		randBuf := make([]byte, 1)
-		rand.Read(randBuf)
-		padding[i] = charset[int(randBuf[0])%len(charset)]
+		padding[i] = charset[int(randBuf[i])%len(charset)]
 	}
-
 	return fmt.Sprintf("%s|%s", payload, string(padding))
 }
