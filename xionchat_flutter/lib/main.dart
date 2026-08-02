@@ -1,163 +1,67 @@
-import 'dart:isolate';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'flutter_bridge.dart';
 
-const _serviceChannelId = 'xionia_mesh';
-const _msgChannelId = 'xionia_messages';
+// ============================================================================
+// CONSTANTES
+// ============================================================================
+const _kServiceChannel = 'com.xionia/service';
+const _kMsgChannelId   = 'xionia_messages';
+const _kMsgChannelName = 'Mensajes XionChat';
 
 // ============================================================================
-// SERVICIO DE BACKGROUND
-// Isolate propio, independiente de la Activity. Es el ÚNICO que sondea
-// XioniaPollMessages() y decide si notificar. Por eso sobrevive a que
-// cierres la app de recientes: aunque la Activity y su FlutterEngine
-// mueran, este isolate sigue vivo dentro del foreground service.
+// NOTIFICACIONES LOCALES
+// Instancia global — se inicializa una vez en _HomeScreenState._init()
+// y se usa desde MessageBus._tick() para notificar mensajes en background.
 // ============================================================================
-Future<void> initializeBackgroundService() async {
-  final service = FlutterBackgroundService();
+final _notifPlugin = FlutterLocalNotificationsPlugin();
 
-  const serviceChannel = AndroidNotificationChannel(
-    _serviceChannelId,
-    'XionIA Mesh',
-    description: 'Nodo mesh soberano activo',
-    importance: Importance.low,
-  );
-  const msgChannel = AndroidNotificationChannel(
-    _msgChannelId,
-    'Mensajes XionChat',
-    description: 'Mensajes entrantes cifrados E2E',
-    importance: Importance.high,
-  );
-
-  final notifPlugin = FlutterLocalNotificationsPlugin();
-  final androidImpl = notifPlugin
-      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
-  await androidImpl?.createNotificationChannel(serviceChannel);
-  await androidImpl?.createNotificationChannel(msgChannel);
-
-  await service.configure(
-    androidConfiguration: AndroidConfiguration(
-      onStart: onServiceStart,
-      autoStart: true,
-      autoStartOnBoot: false,
-      isForegroundMode: true,
-      notificationChannelId: _serviceChannelId,
-      initialNotificationTitle: 'XionChat',
-      initialNotificationContent: 'Nodo mesh conectado',
-      foregroundServiceNotificationId: 888,
-    ),
-    iosConfiguration: IosConfiguration(),
-  );
-  service.startService();
-}
-
-@pragma('vm:entry-point')
-void onServiceStart(ServiceInstance service) async {
-  // Necesario para que plugins con canal de plataforma (path_provider,
-  // flutter_local_notifications) funcionen en este isolate aparte.
-  DartPluginRegistrant.ensureInitialized();
-  // ignore: avoid_print
-  print('[XION-SVC] onServiceStart: isolate iniciado');
-
-  Xionia.init();
-  // ignore: avoid_print
-  print('[XION-SVC] Xionia.ready=${Xionia.ready}');
-  if (!Xionia.ready) return; // sin .so no hay nada que hacer acá
-
-  final dir = await getApplicationDocumentsDirectory();
-  Xionia.setDataDir(dir.path);
-
-  // Reconectar solo si ya había un faro configurado de una sesión
-  // anterior — no forzar conexión la primerísima vez que se instala.
-  final savedStatus = Xionia.getFaroAddr();
-  final savedAddr = savedStatus.split(' (').first.trim();
-  if (savedAddr.isNotEmpty && savedAddr != 'off') {
-    // ignore: avoid_print
-    print('[XION-SVC] connectFaro($savedAddr)');
-    Xionia.connectFaro(savedAddr);
-  }
-
-  final notifPlugin = FlutterLocalNotificationsPlugin();
-  await notifPlugin.initialize(
+Future<void> _initNotifications() async {
+  await _notifPlugin.initialize(
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ),
   );
+  final androidImpl = _notifPlugin
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+  await androidImpl?.createNotificationChannel(
+    const AndroidNotificationChannel(
+      _kMsgChannelId,
+      _kMsgChannelName,
+      description: 'Mensajes entrantes cifrados E2E',
+      importance: Importance.high,
+    ),
+  );
+}
 
-  // Qué chat está mirando el usuario ahora mismo (si hay alguno abierto).
-  // La UI nos lo informa por invoke() cada vez que entra/sale de un chat.
-  String? activeDid;
-  String? activeAlias;
-  service.on('setActiveChat').listen((event) {
-    activeDid = event?['did'] as String?;
-    activeAlias = event?['alias'] as String?;
-  });
-  service.on('connectFaro').listen((event) {
-    final addr = event?['addr'] as String?;
-    if (addr != null && addr.isNotEmpty) {
-      // ignore: avoid_print
-      print('[XION-SVC] connectFaro(invoke)=$addr');
-      Xionia.connectFaro(addr);
-    }
-  });
-
-  Timer.periodic(const Duration(seconds: 5), (timer) {
-    if (!Xionia.ready) return;
-    List<dynamic> polled;
-    try {
-      polled = Xionia.pollMessages();
-    } catch (_) {
-      return;
-    }
-    if (polled.isNotEmpty) {
-      // ignore: avoid_print
-      print('[XION-SVC] poll: ${polled.length} mensaje(s)');
-    }
-    for (final raw in polled) {
-      final m = raw.toString();
-      // Reenviar a la UI si está escuchando (chat abierto en pantalla).
-      service.invoke('message', {'text': m});
-
-      // Si el mensaje es justo del chat que el usuario tiene abierto en
-      // este momento, no hace falta notificar — ya lo está viendo.
-      final isActiveChat = activeDid != null &&
-          (m.contains(activeDid!) || (activeAlias != null && m.contains(activeAlias!)));
-      if (isActiveChat) continue;
-
-      final idx = m.indexOf(': ');
-      final sender = idx == -1 ? m : m.substring(0, idx);
-      final text = idx == -1 ? '' : m.substring(idx + 2).replaceFirst('CHAT:', '');
-
-      const androidDetails = AndroidNotificationDetails(
-        _msgChannelId,
-        'Mensajes XionChat',
-        channelDescription: 'Mensajes entrantes cifrados E2E',
+void _showNotification(String sender, String text) {
+  _notifPlugin.show(
+    DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    '💬 $sender',
+    text,
+    const NotificationDetails(
+      android: AndroidNotificationDetails(
+        _kMsgChannelId,
+        _kMsgChannelName,
         importance: Importance.high,
         priority: Priority.high,
-      );
-      notifPlugin.show(
-        DateTime.now().millisecondsSinceEpoch ~/ 1000,
-        '💬 $sender',
-        text,
-        const NotificationDetails(android: androidDetails),
-      );
-    }
-  });
+      ),
+    ),
+  );
 }
 
 // ============================================================================
-// MESSAGE BUS (lado UI)
-// Ya no sondea directo — recibe los mensajes que el background service
-// le reenvía por invoke('message', ...). Mantiene el mismo buffer en
-// RAM y la misma API que ya usaban HomeScreen/ChatScreen.
+// MESSAGE BUS
+// Modelo idéntico al v0.2-beta: UN SOLO timer en el isolate principal,
+// sondea XioniaPollMessages() directamente (Go vive en el mismo proceso).
+// No hay flutter_background_service, no hay segundo isolate, no hay
+// invoke() entre procesos — la cola Go la lee un único caller.
 // ============================================================================
 class MessageBus {
   MessageBus._();
@@ -165,8 +69,17 @@ class MessageBus {
 
   final _controller = StreamController<String>.broadcast();
   Stream<String> get stream => _controller.stream;
-  StreamSubscription? _serviceSub;
 
+  Timer? _timer;
+
+  // Qué chat tiene el usuario abierto ahora mismo (para no notificar
+  // mensajes que ya está viendo en pantalla).
+  String? activeChatDid;
+  String? activeChatAlias;
+
+  // Buffer circular en RAM: sobrevive a cerrar/reabrir la pantalla de
+  // chat dentro de la misma sesión de la app, pero se pierde si el
+  // proceso muere (sigue siendo "efímero" en ese sentido).
   final List<_BusEntry> _recent = [];
   static const _recentCap = 500;
 
@@ -181,27 +94,53 @@ class MessageBus {
 
   List<String> recentFor(String did, String alias) {
     return _recent
-        .where((e) => e.mine ? e.did == did : (e.display.contains(alias) || e.display.contains(did)))
+        .where((e) => e.mine
+            ? e.did == did
+            : (e.display.contains(alias) || e.display.contains(did)))
         .map((e) => e.display)
         .toList();
   }
 
-  /// Empieza a escuchar los mensajes que reenvía el background service.
-  void listenToService() {
-    if (_serviceSub != null) return;
-    _serviceSub = FlutterBackgroundService().on('message').listen((event) {
-      final s = (event?['text'] ?? '').toString();
-      if (s.isEmpty) return;
-      _remember(_BusEntry(mine: false, did: null, display: s));
-      _controller.add(s);
-    });
+  void start() {
+    if (_timer != null) return;
+    _timer = Timer.periodic(const Duration(seconds: 2), (_) => _tick());
   }
 
-  // Qué chat está mirando el usuario ahora mismo, del lado de la UI
-  // (para que ChatScreen sepa filtrar qué mostrar). Se mantiene en
-  // paralelo al que se le informa al background service.
-  String? activeChatDid;
-  String? activeChatAlias;
+  void stop() {
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  /// Sondea ya mismo sin esperar al próximo tick (útil al volver del
+  /// background para no perder mensajes que llegaron mientras estábamos
+  /// pausados).
+  void pollNow() => _tick();
+
+  void _tick() {
+    if (!Xionia.ready) return;
+    List<dynamic> polled;
+    try {
+      polled = Xionia.pollMessages();
+    } catch (_) {
+      return;
+    }
+    for (final m in polled) {
+      final s = m.toString();
+      _remember(_BusEntry(mine: false, did: null, display: s));
+      _controller.add(s);
+
+      // Notificación local solo si el chat correspondiente NO está abierto
+      final isActiveChat = activeChatDid != null &&
+          (s.contains(activeChatDid!) ||
+              (activeChatAlias != null && s.contains(activeChatAlias!)));
+      if (!isActiveChat) {
+        final idx = s.indexOf(': ');
+        final sender = idx == -1 ? s : s.substring(0, idx);
+        final text   = idx == -1 ? '' : s.substring(idx + 2).replaceFirst('CHAT:', '');
+        _showNotification(sender, text);
+      }
+    }
+  }
 }
 
 class _BusEntry {
@@ -211,13 +150,10 @@ class _BusEntry {
   _BusEntry({required this.mine, required this.did, required this.display});
 }
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  if (Platform.isAndroid) {
-    await initializeBackgroundService();
-  }
-  runApp(const XionChatApp());
-}
+// ============================================================================
+// MAIN
+// ============================================================================
+void main() => runApp(const XionChatApp());
 
 class XionChatApp extends StatelessWidget {
   const XionChatApp({super.key});
@@ -229,9 +165,9 @@ class XionChatApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         colorScheme: ColorScheme.dark(
-          primary: const Color(0xFF128C7E),
+          primary:   const Color(0xFF128C7E),
           secondary: const Color(0xFF25D366),
-          surface: const Color(0xFF121212),
+          surface:   const Color(0xFF121212),
         ),
         scaffoldBackgroundColor: const Color(0xFF0B141A),
       ),
@@ -240,19 +176,24 @@ class XionChatApp extends StatelessWidget {
   }
 }
 
+// ============================================================================
+// HOME SCREEN
+// ============================================================================
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
-
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
-  String myDID = '...';
-  String faroStatus = 'off';
+  String myDID       = '...';
+  String faroStatus  = 'off';
   List<dynamic> contacts = [];
   String? _loadError;
   String _lastFaroAddr = '';
+
+  // MethodChannel al XioniaService.kt nativo (foreground service Kotlin).
+  static const _svcChannel = MethodChannel(_kServiceChannel);
 
   @override
   void initState() {
@@ -268,8 +209,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    // Permisos: notificaciones (Android 13+) y exención de batería, para
-    // que el foreground service no lo mate el optimizador del fabricante.
+    // Permisos: notificaciones (Android 13+) y exención de batería.
     if (Platform.isAndroid) {
       try {
         if (await Permission.notification.isDenied) {
@@ -284,23 +224,32 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final dir = await getApplicationDocumentsDirectory();
     Xionia.setDataDir(dir.path);
 
+    await _initNotifications();
+
+    // Arrancar el foreground service nativo (wakelock, notificación fija).
+    if (Platform.isAndroid) {
+      try {
+        await _svcChannel.invokeMethod('startService');
+      } catch (_) {}
+    }
+
+    // Arrancar el bus de mensajes (timer en este isolate).
+    MessageBus.instance.start();
+
     setState(() {
-      myDID = Xionia.getMyDID();
+      myDID      = Xionia.getMyDID();
       faroStatus = Xionia.getFaroAddr();
-      final raw = faroStatus.split(' (').first.trim();
+      final raw  = faroStatus.split(' (').first.trim();
       if (raw.isNotEmpty && raw != 'off') _lastFaroAddr = raw;
       _loadContacts();
     });
-
-    MessageBus.instance.listenToService();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && Xionia.ready) {
-      // El background service ya se encarga de mantener la conexión y
-      // el polling solo. Acá solo refrescamos lo que se muestra en
-      // pantalla por si cambió mientras estábamos afuera.
+      // Volvemos del background: forzar poll inmediato y refrescar UI.
+      MessageBus.instance.pollNow();
       setState(() => faroStatus = Xionia.getFaroAddr());
     }
   }
@@ -309,11 +258,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => contacts = Xionia.getContacts());
   }
 
+  // --------------------------------------------------------------------------
+  // CONECTAR AL FARO
+  // Corre en Isolate.run() para no bloquear el hilo de UI (el handshake
+  // TLS de WSS puede tardar hasta 5s).
+  // --------------------------------------------------------------------------
   void _connect() {
     showDialog(
       context: context,
       builder: (_) {
-        final ctrl = TextEditingController(text: '190.220.45.26:54321');
+        final ctrl = TextEditingController(text: _lastFaroAddr.isNotEmpty ? _lastFaroAddr : '190.220.45.26:54321');
         bool connecting = false;
         return StatefulBuilder(
           builder: (context, setDialogState) => AlertDialog(
@@ -326,7 +280,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               decoration: const InputDecoration(
                 labelText: 'IP:PUERTO',
                 labelStyle: TextStyle(color: Colors.grey),
-                enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFF128C7E))),
+                enabledBorder: UnderlineInputBorder(
+                    borderSide: BorderSide(color: Color(0xFF128C7E))),
               ),
             ),
             actions: [
@@ -340,22 +295,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     : () async {
                         setDialogState(() => connecting = true);
                         final addr = ctrl.text.trim();
-                        final r = await Isolate.run(() => Xionia.connectFaro(addr)); // ← FIX (era connectFaroAsync)
+                        // Isolate.run: crea un isolate temporario solo para
+                        // esta llamada bloqueante y lo destruye al terminar.
+                        // No es el mismo problema que flutter_background_service
+                        // (que crea un isolate PERMANENTE con su propia copia
+                        // del estado Go). Acá el isolate solo hace la llamada
+                        // FFI bloqueante y devuelve el string resultado — Go
+                        // sigue siendo un único proceso compartido.
+                        final r = await Future(() => Xionia.connectFaro(addr));
                         _lastFaroAddr = addr;
-                        // avisamos también al background service, por si
-                        // el usuario cambió de faro a mano
-                        FlutterBackgroundService().invoke('connectFaro', {'addr': addr});
                         if (context.mounted) Navigator.pop(context);
                         if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(r), backgroundColor: const Color(0xFF1F2C34)));
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                            content: Text(r),
+                            backgroundColor: const Color(0xFF1F2C34),
+                          ));
                           setState(() => faroStatus = Xionia.getFaroAddr());
                         }
                       },
                 child: connecting
                     ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF25D366)),
+                        width: 16, height: 16,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: Color(0xFF25D366)),
                       )
                     : const Text('Conectar', style: TextStyle(color: Color(0xFF25D366))),
               ),
@@ -366,56 +328,81 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  // --------------------------------------------------------------------------
+  // IDENTIDAD
+  // --------------------------------------------------------------------------
   void _showMyIdentity() {
     final id = Xionia.getMyIdentity();
-    Clipboard.setData(ClipboardData(text: id));
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF1F2C34),
         title: const Text('Mi Identidad', style: TextStyle(color: Colors.white)),
-        content: SingleChildScrollView(child: SelectableText(id, style: const TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 12))),
+        content: SingleChildScrollView(
+          child: SelectableText(id,
+              style: const TextStyle(
+                  color: Colors.white, fontFamily: 'monospace', fontSize: 12)),
+        ),
         actions: [
           TextButton(
             onPressed: () {
               Clipboard.setData(ClipboardData(text: id));
               Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Copiado'), duration: Duration(seconds: 1)));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Copiado'), duration: Duration(seconds: 1)),
+              );
             },
             child: const Text('Copiar', style: TextStyle(color: Color(0xFF25D366))),
           ),
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cerrar', style: TextStyle(color: Colors.grey))),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cerrar', style: TextStyle(color: Colors.grey)),
+          ),
         ],
       ),
     );
   }
 
+  // --------------------------------------------------------------------------
+  // COMPARTIR ACL
+  // --------------------------------------------------------------------------
   void _shareACL() {
     final packet = Xionia.exportACL();
-    Clipboard.setData(ClipboardData(text: packet));
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF1F2C34),
         title: const Text('Compartir Red', style: TextStyle(color: Colors.white)),
         content: SingleChildScrollView(
-          child: SelectableText(packet, style: const TextStyle(color: Colors.white, fontFamily: 'monospace', fontSize: 13)),
+          child: SelectableText(packet,
+              style: const TextStyle(
+                  color: Colors.white, fontFamily: 'monospace', fontSize: 13)),
         ),
         actions: [
           TextButton(
             onPressed: () {
               Clipboard.setData(ClipboardData(text: packet));
               Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Copiado al portapapeles'), duration: Duration(seconds: 1)));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                    content: Text('Copiado al portapapeles'),
+                    duration: Duration(seconds: 1)),
+              );
             },
             child: const Text('Copiar', style: TextStyle(color: Color(0xFF25D366))),
           ),
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cerrar', style: TextStyle(color: Colors.grey))),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cerrar', style: TextStyle(color: Colors.grey)),
+          ),
         ],
       ),
     );
   }
 
+  // --------------------------------------------------------------------------
+  // AGREGAR CONTACTO
+  // --------------------------------------------------------------------------
   void _addContact() {
     showDialog(
       context: context,
@@ -435,19 +422,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               decoration: const InputDecoration(
                 hintText: 'acl import did:maia:... pubEd pubX',
                 hintStyle: TextStyle(color: Colors.grey, fontSize: 12),
-                border: OutlineInputBorder(borderSide: BorderSide(color: Color(0xFF128C7E))),
+                border: OutlineInputBorder(
+                    borderSide: BorderSide(color: Color(0xFF128C7E))),
               ),
             ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar', style: TextStyle(color: Colors.grey))),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+            ),
             TextButton(
               onPressed: () {
                 Xionia.importACL(ctrl.text);
                 Xionia.reloadACL();
                 _loadContacts();
                 Navigator.pop(context);
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Contacto agregado'), duration: Duration(seconds: 1)));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                      content: Text('Contacto agregado'),
+                      duration: Duration(seconds: 1)),
+                );
               },
               child: const Text('Agregar', style: TextStyle(color: Color(0xFF25D366))),
             ),
@@ -457,6 +452,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  // --------------------------------------------------------------------------
+  // ALIAS
+  // --------------------------------------------------------------------------
   void _setAliasDialog(String did, String currentAlias) {
     final ctrl = TextEditingController(text: currentAlias);
     showDialog(
@@ -470,11 +468,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           decoration: const InputDecoration(
             hintText: 'Nombre del contacto',
             hintStyle: TextStyle(color: Colors.grey),
-            enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Color(0xFF128C7E))),
+            enabledBorder: UnderlineInputBorder(
+                borderSide: BorderSide(color: Color(0xFF128C7E))),
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar', style: TextStyle(color: Colors.grey))),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+          ),
           TextButton(
             onPressed: () {
               if (ctrl.text.trim().isNotEmpty) {
@@ -493,13 +495,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  void _openChat(String did, String displayName) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => ChatScreen(did: did, alias: displayName)),
-    );
-  }
-
+  // --------------------------------------------------------------------------
+  // RESET
+  // --------------------------------------------------------------------------
   void _showResetMenu() {
     showModalBottomSheet(
       context: context,
@@ -510,15 +508,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           children: [
             ListTile(
               leading: const Icon(Icons.delete_forever, color: Colors.red),
-              title: const Text('RESET TOTAL (borra todo)', style: TextStyle(color: Colors.red)),
-              onTap: () {
-                Xionia.reset();
-                setState(() {
-                  myDID = Xionia.getMyDID();
-                  contacts = [];
-                  faroStatus = 'off';
-                });
+              title: const Text('RESET TOTAL (borra todo)',
+                  style: TextStyle(color: Colors.red)),
+              onTap: () async {
                 Navigator.pop(context);
+                // Parar el bus antes del reset para que no haya ningún
+                // poll en vuelo mientras Go limpia los archivos.
+                MessageBus.instance.stop();
+                Xionia.reset();
+                // Dar tiempo a Go para terminar de limpiar antes de
+                // releer el estado desde Dart.
+                await Future.delayed(const Duration(milliseconds: 500));
+                // Reiniciar el bus limpio.
+                MessageBus.instance.start();
+                if (mounted) {
+                  setState(() {
+                    myDID      = Xionia.getMyDID();
+                    contacts   = [];
+                    faroStatus = 'off';
+                    _lastFaroAddr = '';
+                  });
+                }
               },
             ),
             ListTile(
@@ -532,12 +542,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  void _openChat(String did, String displayName) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => ChatScreen(did: did, alias: displayName)),
+    );
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    MessageBus.instance.stop();
     super.dispose();
   }
 
+  // --------------------------------------------------------------------------
+  // BUILD
+  // --------------------------------------------------------------------------
   @override
   Widget build(BuildContext context) {
     if (_loadError != null) {
@@ -580,7 +601,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
         actions: [
           IconButton(
-            icon: Icon(faroStatus.contains('off') ? Icons.cloud_off : Icons.cloud_done, color: const Color(0xFF25D366)),
+            icon: Icon(
+              faroStatus.contains('off') ? Icons.cloud_off : Icons.cloud_done,
+              color: const Color(0xFF25D366),
+            ),
             onPressed: _connect,
           ),
           PopupMenuButton<String>(
@@ -591,29 +615,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               if (v == 'reset') _showResetMenu();
             },
             itemBuilder: (_) => [
-              const PopupMenuItem(value: 'identity', child: Text('Mi Identidad', style: TextStyle(color: Colors.white))),
-              const PopupMenuItem(value: 'share', child: Text('Compartir Red', style: TextStyle(color: Colors.white))),
-              const PopupMenuItem(value: 'reset', child: Text('RESET', style: TextStyle(color: Colors.red))),
+              const PopupMenuItem(
+                  value: 'identity',
+                  child: Text('Mi Identidad', style: TextStyle(color: Colors.white))),
+              const PopupMenuItem(
+                  value: 'share',
+                  child: Text('Compartir Red', style: TextStyle(color: Colors.white))),
+              const PopupMenuItem(
+                  value: 'reset',
+                  child: Text('RESET', style: TextStyle(color: Colors.red))),
             ],
           ),
         ],
       ),
       body: contacts.isEmpty
-          ? const Center(child: Text('Sin contactos. Agregá uno con el +', style: TextStyle(color: Colors.grey)))
+          ? const Center(
+              child: Text('Sin contactos. Agregá uno con el +',
+                  style: TextStyle(color: Colors.grey)))
           : ListView.builder(
               itemCount: contacts.length,
               itemBuilder: (_, i) {
-                final c = contacts[i];
-                final did = c['did'].toString();
-                final alias = (c['alias'] ?? '').toString();
+                final c       = contacts[i];
+                final did     = c['did'].toString();
+                final alias   = (c['alias'] ?? '').toString();
                 final display = alias.isNotEmpty ? alias : did;
                 return ListTile(
                   leading: CircleAvatar(
                     backgroundColor: const Color(0xFF128C7E),
-                    child: Text(display[0].toUpperCase(), style: const TextStyle(color: Colors.white)),
+                    child: Text(display[0].toUpperCase(),
+                        style: const TextStyle(color: Colors.white)),
                   ),
                   title: Text(display, style: const TextStyle(color: Colors.white)),
-                  subtitle: Text(did, style: const TextStyle(color: Colors.grey, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
+                  subtitle: Text(did,
+                      style: const TextStyle(color: Colors.grey, fontSize: 12),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
                   onTap: () => _openChat(did, display),
                   onLongPress: () => _setAliasDialog(did, alias),
                 );
@@ -628,6 +664,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 }
 
+// ============================================================================
+// CHAT SCREEN
+// ============================================================================
 class ChatScreen extends StatefulWidget {
   final String did;
   final String alias;
@@ -638,10 +677,10 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final ctrl = TextEditingController();
-  final List<String> msgs = [];
+  final _ctrl       = TextEditingController();
+  final _msgs       = <String>[];
+  final _scrollCtrl = ScrollController();
   StreamSubscription<String>? _sub;
-  final ScrollController _scrollCtrl = ScrollController();
   bool _recording = false;
 
   String get _historyFileName {
@@ -657,16 +696,14 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
-    MessageBus.instance.activeChatDid = widget.did;
+    MessageBus.instance.activeChatDid   = widget.did;
     MessageBus.instance.activeChatAlias = widget.alias;
-    // avisamos al background service para que no notifique este chat
-    // mientras lo tenés abierto
-    FlutterBackgroundService().invoke('setActiveChat', {'did': widget.did, 'alias': widget.alias});
 
     _loadHistory();
+
     _sub = MessageBus.instance.stream.listen((m) {
       if (m.contains(widget.alias) || m.contains(widget.did)) {
-        setState(() => msgs.add(m));
+        setState(() => _msgs.add(m));
         _saveIfRecording();
         _scrollToEnd();
       }
@@ -679,18 +716,18 @@ class _ChatScreenState extends State<ChatScreen> {
       final f = await _historyFile();
       if (await f.exists()) {
         final data = jsonDecode(await f.readAsString()) as List<dynamic>;
-        fromFile = data.map((e) => e.toString()).toList();
-        _recording = true;
+        fromFile    = data.map((e) => e.toString()).toList();
+        _recording  = true;
       }
     } catch (_) {}
 
     final fromRam = MessageBus.instance.recentFor(widget.did, widget.alias);
-    final merged = [...fromFile];
+    final merged  = [...fromFile];
     for (final m in fromRam) {
       if (!merged.contains(m)) merged.add(m);
     }
     if (merged.isNotEmpty) {
-      setState(() => msgs.addAll(merged));
+      setState(() => _msgs.addAll(merged));
       _scrollToEnd();
     }
   }
@@ -699,7 +736,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_recording) return;
     try {
       final f = await _historyFile();
-      await f.writeAsString(jsonEncode(msgs));
+      await f.writeAsString(jsonEncode(_msgs));
     } catch (_) {}
   }
 
@@ -709,7 +746,9 @@ class _ChatScreenState extends State<ChatScreen> {
       await _saveIfRecording();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Grabando conversación'), duration: Duration(seconds: 1)),
+          const SnackBar(
+              content: Text('Grabando conversación'),
+              duration: Duration(seconds: 1)),
         );
       }
     } else {
@@ -719,7 +758,9 @@ class _ChatScreenState extends State<ChatScreen> {
       } catch (_) {}
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Chat efímero: se borra al salir'), duration: Duration(seconds: 1)),
+          const SnackBar(
+              content: Text('Chat efímero: se borra al salir'),
+              duration: Duration(seconds: 1)),
         );
       }
     }
@@ -728,29 +769,37 @@ class _ChatScreenState extends State<ChatScreen> {
   void _scrollToEnd() {
     Future.delayed(const Duration(milliseconds: 100), () {
       if (_scrollCtrl.hasClients) {
-        _scrollCtrl.animateTo(_scrollCtrl.position.maxScrollExtent, duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+        _scrollCtrl.animateTo(
+          _scrollCtrl.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
       }
     });
   }
 
   void _send() {
-    if (ctrl.text.isEmpty) return;
-    final r = Xionia.sendChat(widget.did, ctrl.text);
-    final display = 'Tú: ${ctrl.text}';
-    setState(() => msgs.add(display));
+    if (_ctrl.text.isEmpty) return;
+    final text    = _ctrl.text;
+    final r       = Xionia.sendChat(widget.did, text);
+    final display = 'Tú: $text';
+    setState(() => _msgs.add(display));
     MessageBus.instance.addSent(widget.did, display);
     _saveIfRecording();
-    ctrl.clear();
+    _ctrl.clear();
     _scrollToEnd();
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(r), duration: const Duration(seconds: 1), backgroundColor: const Color(0xFF1F2C34)));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(r),
+      duration: const Duration(seconds: 1),
+      backgroundColor: const Color(0xFF1F2C34),
+    ));
   }
 
   @override
   void dispose() {
     if (MessageBus.instance.activeChatDid == widget.did) {
-      MessageBus.instance.activeChatDid = null;
+      MessageBus.instance.activeChatDid   = null;
       MessageBus.instance.activeChatAlias = null;
-      FlutterBackgroundService().invoke('setActiveChat', {'did': null, 'alias': null});
     }
     _sub?.cancel();
     _scrollCtrl.dispose();
@@ -766,9 +815,13 @@ class _ChatScreenState extends State<ChatScreen> {
         title: Text(widget.alias, style: const TextStyle(color: Colors.white)),
         actions: [
           IconButton(
-            tooltip: _recording ? 'Grabando (tocá para volver a efímero)' : 'Chat efímero (tocá para grabar)',
-            icon: Icon(_recording ? Icons.fiber_manual_record : Icons.radio_button_unchecked,
-                color: _recording ? Colors.redAccent : Colors.grey),
+            tooltip: _recording
+                ? 'Grabando (tocá para volver a efímero)'
+                : 'Chat efímero (tocá para grabar)',
+            icon: Icon(
+              _recording ? Icons.fiber_manual_record : Icons.radio_button_unchecked,
+              color: _recording ? Colors.redAccent : Colors.grey,
+            ),
             onPressed: _toggleRecording,
           ),
         ],
@@ -778,22 +831,24 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: ListView.builder(
               controller: _scrollCtrl,
-              itemCount: msgs.length,
+              itemCount: _msgs.length,
               itemBuilder: (_, i) {
-                final isMe = msgs[i].startsWith('Tú:');
-                // ← FIX: limpieza del prefijo CHAT: del motor
-                final text = msgs[i]
+                final isMe = _msgs[i].startsWith('Tú:');
+                final text = _msgs[i]
                     .replaceFirst('Tú: ', '')
-                    .replaceFirst(RegExp(r'^[^:]+: '), '')
+                    .replaceFirst(RegExp(r'^[^:]+:\s*'), '')
                     .replaceFirst(RegExp(r'^CHAT:\s*'), '');
                 return Align(
                   alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
                   child: Container(
                     margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                     padding: const EdgeInsets.all(12),
-                    constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+                    constraints: BoxConstraints(
+                        maxWidth: MediaQuery.of(context).size.width * 0.75),
                     decoration: BoxDecoration(
-                      color: isMe ? const Color(0xFF005C4B) : const Color(0xFF1F2C34),
+                      color: isMe
+                          ? const Color(0xFF005C4B)
+                          : const Color(0xFF1F2C34),
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(text, style: const TextStyle(color: Colors.white)),
@@ -809,13 +864,20 @@ class _ChatScreenState extends State<ChatScreen> {
               children: [
                 Expanded(
                   child: TextField(
-                    controller: ctrl,
+                    controller: _ctrl,
                     style: const TextStyle(color: Colors.white),
-                    decoration: const InputDecoration(hintText: 'Mensaje...', hintStyle: TextStyle(color: Colors.grey), border: InputBorder.none),
+                    decoration: const InputDecoration(
+                      hintText: 'Mensaje...',
+                      hintStyle: TextStyle(color: Colors.grey),
+                      border: InputBorder.none,
+                    ),
                     onSubmitted: (_) => _send(),
                   ),
                 ),
-                IconButton(icon: const Icon(Icons.send, color: Color(0xFF25D366)), onPressed: _send),
+                IconButton(
+                  icon: const Icon(Icons.send, color: Color(0xFF25D366)),
+                  onPressed: _send,
+                ),
               ],
             ),
           ),

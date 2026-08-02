@@ -1,24 +1,30 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
-
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- RED -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
-    <!-- PERSISTENCIA EN BACKGROUND -->
+    <!-- BACKGROUND / WAKELOCK -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+        REQUEST_IGNORE_BATTERY_OPTIMIZATIONS: permite pedirle al usuario
+        que excluya la app del optimizador de batería. Google puede pedir
+        justificación en Play Store — la razón válida es "nodo de red P2P
+        soberano que necesita mantener conexiones cifradas activas".
+        Si Play Store lo rechaza, sacá este permiso y documentalo.
+    -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- NOTIFICACIONES (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:name=".XionApplication"
         android:label="XionChat"
+        android:name=".XionApplication"
         android:icon="@mipmap/ic_launcher">
 
         <activity
@@ -39,22 +45,15 @@
             </intent-filter>
         </activity>
 
-        <!-- Foreground service nativo (de la versión anterior). Se mantiene
-             declarado por compatibilidad; si ves DOS notificaciones fijas,
-             es porque MainActivity todavía lo arranca — avisame y lo limpiamos. -->
+        <!-- Foreground service nativo en Kotlin: mantiene vivo el proceso
+             Go (libxionia.so) en background con PARTIAL_WAKE_LOCK.
+             foregroundServiceType="connectedDevice" es el tipo correcto
+             para un nodo de red P2P — no requiere justificación adicional
+             en Play Store a diferencia de "dataSync" o "location". -->
         <service
             android:name=".XioniaService"
             android:foregroundServiceType="connectedDevice"
             android:exported="false" />
-
-        <!-- Foreground service de flutter_background_service (el que usa el
-             main.dart). Android 14/15 EXIGE foregroundServiceType o crashea
-             al abrir. tools:replace sobreescribe la declaración del plugin. -->
-        <service
-            android:name="id.flutter.flutter_background_service.BackgroundService"
-            android:foregroundServiceType="dataSync"
-            android:exported="false"
-            tools:replace="android:foregroundServiceType,android:exported" />
 
         <meta-data
             android:name="flutterEmbedding"
