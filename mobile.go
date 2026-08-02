@@ -131,7 +131,14 @@ func staleSince() time.Duration {
 	return time.Since(lastActivity)
 }
 
+var idMu sync.Mutex
+
 func ensureIdentity() *crypto.Identity {
+	if globalID != nil {
+		return globalID
+	}
+	idMu.Lock()
+	defer idMu.Unlock()
 	if globalID != nil {
 		return globalID
 	}
@@ -541,7 +548,8 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 					}
 				}
 
-				fullMsg := fmt.Sprintf("%s: %s", displayName, command)
+				displayCmd := strings.TrimPrefix(command, "CHAT:")
+				fullMsg := fmt.Sprintf("%s: %s", displayName, displayCmd)
 				recvMu.Lock()
 				recvMessages = append(recvMessages, fullMsg)
 				if len(recvMessages) > 200 {
@@ -870,6 +878,10 @@ func XioniaReset() {
 		os.Remove("acl.json")
 		os.Remove("aliases.json")
 	})
+	aclIndexMu.Lock()
+	globalACLIdx = nil
+	aclIndexMu.Unlock()
+	lastPublicIP = ""
 	globalID = nil
 }
 

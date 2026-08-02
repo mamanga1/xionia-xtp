@@ -22,7 +22,7 @@ class XioniaService : Service() {
             "xionia::mesh_wakelock"
         ).apply {
             setReferenceCounted(false)
-            acquire()
+            acquire(10 * 60 * 1000L)
         }
 
         val notification = createNotification()
