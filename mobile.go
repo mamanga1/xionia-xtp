@@ -63,7 +63,40 @@ func XioniaSetDataDir(path *C.char) {
 	logf("DataDir: %s", dataDir)
 }
 
+// ========== UTILIDADES ==========
+
+// stripANSI elimina secuencias de escape ANSI de un string.
+// El shell de Web5-Mesh emite mensajes con colores (ej: \x1b[32m💬...)
+// que llegarían como texto crudo a Flutter si no se limpian aquí,
+// antes de pushear al buffer recvMessages.
+func stripANSI(s string) string {
+	var result []byte
+	i := 0
+	for i < len(s) {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && s[i] != 'm' {
+				i++
+			}
+			i++ // consumir la 'm'
+		} else {
+			result = append(result, s[i])
+			i++
+		}
+	}
+	return string(result)
+}
+
+// cleanCmd: quita prefijo CHAT: y secuencias ANSI de un comando entrante.
+// Centraliza la limpieza para que tanto el path relay-legacy como el
+// path XTP usen exactamente el mismo código.
+func cleanCmd(cmd string) string {
+	s := strings.TrimPrefix(cmd, "CHAT:")
+	return stripANSI(s)
+}
+
 // ========== MOTOR DE RED ==========
+
 type InnerPayload struct {
 	FromDID string `json:"from"`
 	TS      int64  `json:"ts"`
@@ -74,22 +107,16 @@ type InnerPayload struct {
 type peerKeys struct {
 	DID       string
 	PubKeyEd  []byte
-	PubKeyX   []byte // ← FIX: mismo bug que session.go — sin esto no hay Noise IK posible
+	PubKeyX   []byte
 	SharedKey []byte
 }
 
 var (
-	// connMu protege TODO el estado de la conexión activa (globalConn,
-	// globalConnWS, globalUseWS). Se toca desde la goroutine de runNode()
-	// Y desde llamadas FFI disparadas por la UI de Flutter en paralelo,
-	// así que sin este mutex hay una carrera de datos real.
 	connMu       sync.Mutex
 	globalConn   *net.UDPConn
 	globalConnWS *websocket.Conn
 	globalUseWS  bool
 
-	// quitMu protege el ciclo de vida de globalQuit para que Reset() no
-	// pueda hacer close() de un canal ya cerrado (panic).
 	quitMu     sync.Mutex
 	globalQuit = make(chan struct{})
 
@@ -102,16 +129,8 @@ var (
 	globalACLIdx map[[4]byte]peerKeys
 	lastPublicIP string
 
-	// XTP: Transport Manager (Fase 2). Se crea una sola vez, dentro de
-	// runNode(), que solo corre una vez por vida de la app (guardado por
-	// nodeMu/nodeRunning). Mismo patrón que shell.go.
 	globalTM *xtp.TransportManager
 
-	// lastActivity: última vez que hubo señal de vida real con el Faro
-	// (mensaje recibido o ANNOUNCE mandado con éxito). Watchdog puramente
-	// en Go, independiente de que algún isolate de Dart esté atento —
-	// si el proceso entero se congela (freezer/Doze agresivo) y luego
-	// se destraba, esto fuerza una reconexión sin depender de nadie más.
 	activityMu   sync.Mutex
 	lastActivity time.Time
 )
@@ -168,16 +187,12 @@ func connectToFaro(addr string) error {
 	}
 	connMu.Unlock()
 
-	// 1. UDP primero (default, incluye el propio 443) — con Gate DID.
 	if err := connectUDP(addr); err == nil {
 		return nil
 	}
-
-	// 2. WSS fallback — con Gate DID por headers.
 	if err := connectWS(addr); err == nil {
 		return nil
 	}
-
 	return fmt.Errorf("sin ruta al faro %s", addr)
 }
 
@@ -196,7 +211,6 @@ func connectUDP(addr string) error {
 		return fmt.Errorf("conectando UDP: %v", err)
 	}
 
-	// Handshake del Gate DID: sin esto el faro descarta todo en silencio.
 	hs, err := crypto.CreateHandshake(myID)
 	if err != nil {
 		conn.Close()
@@ -351,16 +365,12 @@ func extractPayload(raw string) string {
 	return raw
 }
 
-// XTP: implementa xtp.FaroSender reusando el sendToFaro que ya existe
-// (el mismo socket UDP/WS que usa el resto de mobile.go).
 type faroSenderMobile struct{}
 
 func (f faroSenderMobile) SendToFaro(msg string) error {
 	return sendToFaro(msg)
 }
 
-// buildXTPACLIndex: mismo patrón que shell.go — convierte el índice ACL
-// local (map[[4]byte]peerKeys) al tipo que espera el paquete xtp.
 func buildXTPACLIndex() map[[4]byte]xtp.PeerKeys {
 	aclIndexMu.RLock()
 	defer aclIndexMu.RUnlock()
@@ -420,9 +430,6 @@ func XioniaReloadACL() {
 	aclIndexMu.Unlock()
 	logf("ReloadACL: %d pares", len(idx))
 
-	// XTP: mantener su copia del ACL sincronizada — si no se hace esto,
-	// un contacto agregado después de crear el TransportManager nunca
-	// va a poder abrir sesión directa, solo relay.
 	if globalTM != nil {
 		globalTM.UpdateACL(buildXTPACLIndex())
 	}
@@ -458,11 +465,31 @@ func sendAnnounce(myID *crypto.Identity) {
 	}
 }
 
+// pushMsg: punto centralizado para agregar mensajes al buffer recvMessages.
+// Aplica cleanCmd() en todos los casos — CHAT: y ANSI se limpian
+// exactamente una vez, independientemente del path por el que llegó el mensaje.
+func pushMsg(displayName, cmd string) {
+	fullMsg := fmt.Sprintf("%s: %s", displayName, cleanCmd(cmd))
+	recvMu.Lock()
+	recvMessages = append(recvMessages, fullMsg)
+	if len(recvMessages) > 200 {
+		recvMessages = recvMessages[len(recvMessages)-200:]
+	}
+	recvMu.Unlock()
+}
+
+// pushGroupMsg: igual que pushMsg pero para mensajes de grupo.
+func pushGroupMsg(groupAlias, displayName, text string) {
+	fullMsg := fmt.Sprintf("[GRUPO:%s] %s: %s", groupAlias, displayName, stripANSI(text))
+	recvMu.Lock()
+	recvMessages = append(recvMessages, fullMsg)
+	if len(recvMessages) > 200 {
+		recvMessages = recvMessages[len(recvMessages)-200:]
+	}
+	recvMu.Unlock()
+}
+
 func runNode(myID *crypto.Identity, quit chan struct{}) {
-	// Red de seguridad: en una lib cgo un panic sin recuperar en
-	// cualquier goroutine tira abajo el proceso entero de la app
-	// (no solo esta goroutine). Sin esto, un bug de red podría
-	// crashear XionChat en vez de solo reconectar.
 	defer func() {
 		if r := recover(); r != nil {
 			logf("PANIC recuperado en runNode: %v — reintentando en 2s", r)
@@ -476,24 +503,15 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
-	// Carga inicial
 	XioniaReloadACL()
 
-	// XTP: crear el TransportManager una sola vez. runNode() solo corre
-	// una vez por vida de la app (lo garantiza nodeMu/nodeRunning en
-	// startNodeIfNeeded), así que este es el lugar correcto — mismo
-	// patrón que runInteractiveShell() en shell.go.
 	globalTM = xtp.NewTransportManager(
 		myID,
 		faroSenderMobile{},
 		buildXTPACLIndex(),
 		xtp.ManagerCallbacks{
-			// OnMessage empuja al MISMO buffer que ya consume
-			// XioniaPollMessages() — Flutter no necesita cambiar nada,
-			// los mensajes que lleguen por directo (Noise IK) o por
-			// relay entran por el mismo caño hacia la UI.
 			OnMessage: func(peerDID, displayName, command string) {
-				// Procesar comandos de grupo (no mostrar como chat)
+				// Comandos de grupo: gestión interna, no van al chat UI
 				if strings.HasPrefix(command, "GROUP_SYNC:") {
 					parts := strings.SplitN(command, ":", 3)
 					if len(parts) == 3 {
@@ -537,25 +555,12 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 				if strings.HasPrefix(command, "GROUP:") {
 					parts := strings.SplitN(command, ":", 3)
 					if len(parts) == 3 {
-						fullMsg := fmt.Sprintf("[GRUPO:%s] %s: %s", parts[1], displayName, parts[2])
-						recvMu.Lock()
-						recvMessages = append(recvMessages, fullMsg)
-						if len(recvMessages) > 200 {
-							recvMessages = recvMessages[len(recvMessages)-200:]
-						}
-						recvMu.Unlock()
-						return
+						pushGroupMsg(parts[1], displayName, parts[2])
 					}
+					return
 				}
-
-				displayCmd := strings.TrimPrefix(command, "CHAT:")
-				fullMsg := fmt.Sprintf("%s: %s", displayName, displayCmd)
-				recvMu.Lock()
-				recvMessages = append(recvMessages, fullMsg)
-				if len(recvMessages) > 200 {
-					recvMessages = recvMessages[len(recvMessages)-200:]
-				}
-				recvMu.Unlock()
+				// Mensaje directo normal
+				pushMsg(displayName, command)
 				logf("[XTP MSG %s]: %s", peerDID, command)
 			},
 			OnDirectSessionActive: func(peerDID string) {
@@ -576,20 +581,13 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		},
 		xtp.DefaultManagerConfig(),
 	)
-	// El faro ya está conectado a esta altura (connectToFaro corrió antes
-	// de que startNodeIfNeeded() dispare este runNode), así que avisamos
-	// a la FSM de una: mismo orden que shell.go.
+
 	globalTM.FSM().Send(xtp.EvConnectFaro, nil)
 	globalTM.FSM().Send(xtp.EvFaroConnected, nil)
 	globalTM.FSM().Send(xtp.EvAnnounceSent, nil)
 
-	// Primer ANNOUNCE inmediato (no esperar el ticker) para re-punchear
-	// el NAT lo antes posible al conectar/reconectar.
 	sendAnnounce(myID)
 
-	// Retry a los 3s: el primer ANNOUNCE a veces sale antes de que el
-	// faro termine de procesar el handshake del Gate ("hay que
-	// saludarse dos veces"). Mismo fix que shell.go.
 	go func() {
 		select {
 		case <-quit:
@@ -599,7 +597,6 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
-	// ANNOUNCE cada 10s
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -613,12 +610,6 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
-	// Watchdog: si pasan 20s sin ninguna señal de vida (ni recibimos
-	// nada del Faro ni logramos mandar un ANNOUNCE), fuerza reconexión
-	// ya mismo. No depende de que el read loop haga timeout por su
-	// cuenta (eso tarda hasta 15s por ciclo) ni de que algún isolate de
-	// Dart esté atento — es puramente Go, sobrevive a que el proceso se
-	// haya congelado y recién ahora vuelva a correr.
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -657,7 +648,6 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
-	// Listener principal (con reconexión como shell.go)
 	for {
 		select {
 		case <-quit:
@@ -680,7 +670,6 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 				return
 			default:
 			}
-			// Socket roto o timeout: reconectar
 			connMu.Lock()
 			if !globalUseWS && globalConn != nil {
 				globalConn.Close()
@@ -699,21 +688,15 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 			continue
 		}
 
-		// Cualquier paquete recibido, sea lo que sea, prueba que el
-		// camino de red funciona — alimenta al watchdog.
 		touchActivity()
 
 		raw = stripPadding(raw)
 		raw = extractPayload(raw)
 
-		// XTP: rutear al TransportManager (signaling de sesión directa
-		// o mensaje por relay ya envuelto). Mismo orden que shell.go:
-		// después de stripPadding/extractPayload, antes de ACK_IP.
 		if globalTM != nil && globalTM.HandleIncoming(raw) {
 			continue
 		}
 
-		// ACK_IP: roaming
 		if strings.HasPrefix(raw, "ACK_IP ") {
 			parts := strings.SplitN(raw, " ", 2)
 			if len(parts) == 2 {
@@ -783,15 +766,10 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 
 		displayName := crypto.ResolveDID(peer.DID)
-		fullMsg := fmt.Sprintf("%s: %s", displayName, inner.Cmd)
 
-		recvMu.Lock()
-		recvMessages = append(recvMessages, fullMsg)
-		if len(recvMessages) > 200 {
-			recvMessages = recvMessages[len(recvMessages)-200:]
-		}
-		recvMu.Unlock()
-
+		// FIX: relay legacy también usa pushMsg — CHAT: y ANSI se limpian
+		// exactamente igual que en el path XTP (OnMessage arriba).
+		pushMsg(displayName, inner.Cmd)
 		logf("[MSG %s]: %s", peer.DID, inner.Cmd)
 	}
 }
@@ -856,6 +834,8 @@ func XioniaReset() {
 	nodeRunning = false
 	nodeMu.Unlock()
 
+	time.Sleep(300 * time.Millisecond)
+
 	if globalTM != nil {
 		globalTM.Close()
 		globalTM = nil
@@ -889,8 +869,11 @@ func XioniaReset() {
 	aclIndexMu.Lock()
 	globalACLIdx = nil
 	aclIndexMu.Unlock()
-	lastPublicIP = ""
+	idMu.Lock()
 	globalID = nil
+	idMu.Unlock()
+
+	lastPublicIP = ""
 }
 
 //export XioniaGetMyIdentity
@@ -1005,10 +988,6 @@ func XioniaConnectFaro(addrC *C.char) *C.char {
 
 	startNodeIfNeeded()
 
-	// Si el nodo ya estaba corriendo (ej: la app vuelve de background y
-	// Flutter llama ConnectFaro de nuevo para forzar reconexión), el
-	// socket se reabrió arriba pero el goroutine de announce sigue con
-	// su propio timer de 15s. Mandamos uno ya mismo para no esperar.
 	if id := ensureIdentity(); id != nil {
 		go sendAnnounce(id)
 	}
@@ -1031,9 +1010,6 @@ func XioniaGetFaroAddr() *C.char {
 	return C.CString(config.GetFaroAddr() + " (off)")
 }
 
-// sendChatCommon: usado tanto por XioniaSendChat como por XioniaSendXTP.
-// Si el TransportManager ya está armado, lo usa (elige directo Noise IK
-// o relay automáticamente); si no, cae al camino legacy de siempre.
 func sendChatCommon(target, msg string) string {
 	id := ensureIdentity()
 	if id == nil {
@@ -1123,6 +1099,160 @@ func XioniaPollMessages() *C.char {
 //export XioniaFreeString
 func XioniaFreeString(s *C.char) {
 	C.free(unsafe.Pointer(s))
+}
+
+// ========== GRUPOS — FFI ==========
+
+// XioniaCreateGroup crea un grupo nuevo con el nodo local como admin.
+// Parámetros: alias (clave interna), name (nombre visible).
+// Retorna "OK" o "ERROR: ...".
+//
+//export XioniaCreateGroup
+func XioniaCreateGroup(aliasC, nameC *C.char) *C.char {
+	alias := C.GoString(aliasC)
+	name := C.GoString(nameC)
+	if alias == "" {
+		return C.CString("ERROR: alias vacío")
+	}
+	id := ensureIdentity()
+	if id == nil {
+		return C.CString("ERROR: sin identidad")
+	}
+	var result string
+	inDataDir(func() {
+		if err := crypto.CreateGroup(alias, name, id.DID); err != nil {
+			result = "ERROR: " + err.Error()
+		} else {
+			result = "OK"
+		}
+	})
+	return C.CString(result)
+}
+
+// XioniaGroupSend envía un mensaje a todos los miembros del grupo.
+// Usa XTP si está disponible; cae a relay legacy si no.
+//
+//export XioniaGroupSend
+func XioniaGroupSend(aliasC, messageC *C.char) *C.char {
+	alias := C.GoString(aliasC)
+	msg := C.GoString(messageC)
+	id := ensureIdentity()
+	if id == nil {
+		return C.CString("ERROR: sin identidad")
+	}
+
+	var group *crypto.Group
+	inDataDir(func() {
+		g, ok := crypto.GetGroup(alias)
+		if ok {
+			group = g
+		}
+	})
+	if group == nil {
+		return C.CString("ERROR: grupo no encontrado")
+	}
+
+	cmd := fmt.Sprintf("GROUP:%s:%s", alias, msg)
+	sent := 0
+	for _, memberDID := range group.Members {
+		if memberDID == id.DID {
+			continue // no mandarse a uno mismo
+		}
+		if globalTM != nil {
+			if _, err := globalTM.Send(memberDID, cmd); err == nil {
+				sent++
+			}
+		} else {
+			if ExecuteRealCommand(id, memberDID, cmd) == "📤 Enviado" {
+				sent++
+			}
+		}
+	}
+	return C.CString(fmt.Sprintf("OK:%d", sent))
+}
+
+// XioniaListGroups retorna los grupos del nodo como JSON.
+// Formato: [{"alias":"g1","name":"Nombre","members":["did1","did2"],"admin":"did1"}]
+//
+//export XioniaListGroups
+func XioniaListGroups() *C.char {
+	type GroupInfo struct {
+		Alias   string   `json:"alias"`
+		Name    string   `json:"name"`
+		Members []string `json:"members"`
+		Admin   string   `json:"admin"`
+	}
+	var result string
+	inDataDir(func() {
+		store, err := crypto.LoadGroups()
+		if err != nil || store == nil {
+			result = "[]"
+			return
+		}
+		list := make([]GroupInfo, 0, len(store.Groups))
+		for alias, g := range store.Groups {
+			list = append(list, GroupInfo{
+				Alias:   alias,
+				Name:    g.Name,
+				Members: g.Members,
+				Admin:   g.Admin,
+			})
+		}
+		b, _ := json.Marshal(list)
+		result = string(b)
+	})
+	if result == "" {
+		result = "[]"
+	}
+	return C.CString(result)
+}
+
+// XioniaGroupAddMember agrega un DID al grupo. Solo el admin debería llamar esto.
+// Después de agregar, sincroniza el grupo al nuevo miembro (GROUP_SYNC).
+//
+//export XioniaGroupAddMember
+func XioniaGroupAddMember(aliasC, targetDIDC *C.char) *C.char {
+	alias := C.GoString(aliasC)
+	targetDID := C.GoString(targetDIDC)
+	id := ensureIdentity()
+	if id == nil {
+		return C.CString("ERROR: sin identidad")
+	}
+
+	var result string
+	inDataDir(func() {
+		group, ok := crypto.GetGroup(alias)
+		if !ok {
+			result = "ERROR: grupo no encontrado"
+			return
+		}
+		if group.Admin != id.DID {
+			result = "ERROR: solo el admin puede agregar miembros"
+			return
+		}
+		if err := crypto.AddMember(alias, targetDID); err != nil {
+			result = "ERROR: " + err.Error()
+			return
+		}
+		// Recargar para obtener el grupo actualizado con el nuevo miembro
+		group, _ = crypto.GetGroup(alias)
+		if group == nil {
+			result = "OK" // se agregó pero no pudimos recargar
+			return
+		}
+		// Sincronizar el grupo completo al nuevo miembro
+		groupJSON, err := json.Marshal(group)
+		if err == nil {
+			syncCmd := fmt.Sprintf("GROUP_SYNC:%s:%s", alias, string(groupJSON))
+			if globalTM != nil {
+				globalTM.Send(targetDID, syncCmd)
+			} else {
+				ExecuteRealCommand(id, targetDID, syncCmd)
+			}
+		}
+		result = "OK"
+	})
+	return C.CString(result)
 }
 
 func main() {}
