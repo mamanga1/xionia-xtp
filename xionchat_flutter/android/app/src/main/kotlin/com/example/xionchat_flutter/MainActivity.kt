@@ -19,9 +19,9 @@ class MainActivity : FlutterActivity() {
                     "startService" -> {
                         val intent = Intent(this, XioniaService::class.java)
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            startForegroundService(intent)
+                            // startForegroundService(intent) // desactivado: flutter_background_service lo reemplaza
                         } else {
-                            startService(intent)
+                            // startService(intent) // desactivado
                         }
                         result.success(true)
                     }

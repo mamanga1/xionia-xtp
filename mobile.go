@@ -661,6 +661,10 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 	for {
 		select {
 		case <-quit:
+			if globalTM != nil {
+				globalTM.Close()
+				globalTM = nil
+			}
 			return
 		default:
 		}
@@ -669,6 +673,10 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		if err != nil {
 			select {
 			case <-quit:
+				if globalTM != nil {
+					globalTM.Close()
+					globalTM = nil
+				}
 				return
 			default:
 			}

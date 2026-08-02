@@ -1,3 +1,4 @@
+import 'dart:isolate';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -108,7 +109,7 @@ void onServiceStart(ServiceInstance service) async {
     }
   });
 
-  Timer.periodic(const Duration(seconds: 2), (timer) {
+  Timer.periodic(const Duration(seconds: 5), (timer) {
     if (!Xionia.ready) return;
     List<dynamic> polled;
     try {
@@ -339,7 +340,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     : () async {
                         setDialogState(() => connecting = true);
                         final addr = ctrl.text.trim();
-                        final r = await Future(() => Xionia.connectFaro(addr)); // ← FIX (era connectFaroAsync)
+                        final r = await Isolate.run(() => Xionia.connectFaro(addr)); // ← FIX (era connectFaroAsync)
                         _lastFaroAddr = addr;
                         // avisamos también al background service, por si
                         // el usuario cambió de faro a mano
