@@ -97,6 +97,10 @@ extern char* XioniaGetMyDID();
 extern char* XioniaGetContactsJSON();
 extern char* XioniaPollMessages();
 extern void XioniaFreeString(char* s);
+extern char* XioniaCreateGroup(char* aliasC, char* nameC);
+extern char* XioniaGroupSend(char* aliasC, char* messageC);
+extern char* XioniaListGroups();
+extern char* XioniaGroupAddMember(char* aliasC, char* targetDIDC);
 
 #ifdef __cplusplus
 }
