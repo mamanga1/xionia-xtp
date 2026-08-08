@@ -27,13 +27,22 @@ import (
 	"xionia-xtp/src/xtp"
 )
 
+// ── PATCH A ─────────────────────────────────────────────────
+// BuildType se setea en tiempo de compilación:
+// go build -ldflags "-X main.BuildType=release"
+// El build.sh de Android debe incluir ese flag para release builds.
+var BuildType = "debug"
+
+// ────────────────────────────────────────────────────────────
+
 var dataDir string
 
 func logf(format string, args ...interface{}) {
 	if dataDir == "" {
 		dataDir = "."
 	}
-	f, _ := os.OpenFile(dataDir+"/xionia.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// PATCH B — permisos 0600 (era 0644)
+	f, _ := os.OpenFile(dataDir+"/xionia.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if f != nil {
 		fmt.Fprintf(f, time.Now().Format("15:04:05")+" "+format+"\n", args...)
 		f.Close()
@@ -60,15 +69,13 @@ func XioniaSetDataDir(path *C.char) {
 	_ = os.MkdirAll(dataDir, 0755)
 	_ = os.Chdir(dataDir)
 	os.Setenv("XION_HOME", dataDir)
+	// PATCH C — permisos seguros en el directorio de identidad
+	os.Chmod(dataDir, 0700)
 	logf("DataDir: %s", dataDir)
 }
 
 // ========== UTILIDADES ==========
 
-// stripANSI elimina secuencias de escape ANSI de un string.
-// El shell de Web5-Mesh emite mensajes con colores (ej: \x1b[32m💬...)
-// que llegarían como texto crudo a Flutter si no se limpian aquí,
-// antes de pushear al buffer recvMessages.
 func stripANSI(s string) string {
 	var result []byte
 	i := 0
@@ -78,7 +85,7 @@ func stripANSI(s string) string {
 			for i < len(s) && s[i] != 'm' {
 				i++
 			}
-			i++ // consumir la 'm'
+			i++
 		} else {
 			result = append(result, s[i])
 			i++
@@ -87,9 +94,6 @@ func stripANSI(s string) string {
 	return string(result)
 }
 
-// cleanCmd: quita prefijo CHAT: y secuencias ANSI de un comando entrante.
-// Centraliza la limpieza para que tanto el path relay-legacy como el
-// path XTP usen exactamente el mismo código.
 func cleanCmd(cmd string) string {
 	s := strings.TrimPrefix(cmd, "CHAT:")
 	return stripANSI(s)
@@ -166,6 +170,8 @@ func ensureIdentity() *crypto.Identity {
 		if err == nil {
 			globalID = id
 			crypto.SetSelfDID(id.DID)
+			// PATCH C — asegurar permisos de node.key al cargar/crear
+			os.Chmod(dataDir+"/node.key", 0600)
 		} else {
 			logf("ensureIdentity ERROR: %v", err)
 		}
@@ -268,8 +274,14 @@ func connectWS(addr string) error {
 	headers.Set("X-Xionia-Sig", base64.StdEncoding.EncodeToString(sig))
 
 	wsURL := fmt.Sprintf("wss://%s/ws", wsHost)
+
+	// PATCH A — InsecureSkipVerify solo activo en debug builds.
+	// En release (BuildType="release") siempre es false.
+	// Para activar en debug: XION_INSECURE_WS=1 (solo desarrollo local).
+	insecureSkip := BuildType != "release" && os.Getenv("XION_INSECURE_WS") == "1"
+
 	dialer := websocket.Dialer{
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: os.Getenv("XION_INSECURE_WS") == "1"},
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: insecureSkip},
 		HandshakeTimeout: 5 * time.Second,
 	}
 	ws, _, err := dialer.Dial(wsURL, headers)
@@ -465,9 +477,6 @@ func sendAnnounce(myID *crypto.Identity) {
 	}
 }
 
-// pushMsg: punto centralizado para agregar mensajes al buffer recvMessages.
-// Aplica cleanCmd() en todos los casos — CHAT: y ANSI se limpian
-// exactamente una vez, independientemente del path por el que llegó el mensaje.
 func pushMsg(displayName, cmd string) {
 	fullMsg := fmt.Sprintf("%s: %s", displayName, cleanCmd(cmd))
 	recvMu.Lock()
@@ -478,7 +487,6 @@ func pushMsg(displayName, cmd string) {
 	recvMu.Unlock()
 }
 
-// pushGroupMsg: igual que pushMsg pero para mensajes de grupo.
 func pushGroupMsg(groupAlias, displayName, text string) {
 	fullMsg := fmt.Sprintf("[GRUPO:%s] %s: %s", groupAlias, displayName, stripANSI(text))
 	recvMu.Lock()
@@ -492,10 +500,11 @@ func pushGroupMsg(groupAlias, displayName, text string) {
 func runNode(myID *crypto.Identity, quit chan struct{}) {
 	defer func() {
 		if r := recover(); r != nil {
-			logf("PANIC recuperado en runNode: %v — reintentando en 2s", r)
+			logf("PANIC recuperado en runNode: %v — reintentando", r)
 			nodeMu.Lock()
 			stillWanted := nodeRunning
 			nodeMu.Unlock()
+			// PATCH D — backoff inicial antes de reintentar tras panic
 			time.Sleep(2 * time.Second)
 			if stillWanted {
 				go runNode(myID, quit)
@@ -511,7 +520,6 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		buildXTPACLIndex(),
 		xtp.ManagerCallbacks{
 			OnMessage: func(peerDID, displayName, command string) {
-				// Comandos de grupo: gestión interna, no van al chat UI
 				if strings.HasPrefix(command, "GROUP_SYNC:") {
 					parts := strings.SplitN(command, ":", 3)
 					if len(parts) == 3 {
@@ -559,7 +567,6 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 					}
 					return
 				}
-				// Mensaje directo normal
 				pushMsg(displayName, command)
 				logf("[XTP MSG %s]: %s", peerDID, command)
 			},
@@ -648,6 +655,9 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 	}()
 
+	// PATCH D — backoff exponencial en el loop principal de reconexión
+	reconnectBackoff := 2 * time.Second
+
 	for {
 		select {
 		case <-quit:
@@ -680,14 +690,28 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 				globalConnWS = nil
 			}
 			connMu.Unlock()
-			time.Sleep(2 * time.Second)
+
+			// PATCH D — esperar con backoff exponencial (2s→4s→8s→...→60s)
+			logf("[RECONEXION] esperando %v antes de reintentar", reconnectBackoff)
+			time.Sleep(reconnectBackoff)
+			reconnectBackoff = reconnectBackoff * 2
+			if reconnectBackoff > 60*time.Second {
+				reconnectBackoff = 60 * time.Second
+			}
+
 			addr := config.GetFaroAddr()
 			if addr != "" {
-				_ = connectToFaro(addr)
+				if err := connectToFaro(addr); err == nil {
+					// Conexión exitosa — resetear backoff
+					reconnectBackoff = 2 * time.Second
+					logf("[RECONEXION] exitosa, backoff reseteado")
+				}
 			}
 			continue
 		}
 
+		// Conexión activa — resetear backoff
+		reconnectBackoff = 2 * time.Second
 		touchActivity()
 
 		raw = stripPadding(raw)
@@ -766,9 +790,6 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 		}
 
 		displayName := crypto.ResolveDID(peer.DID)
-
-		// FIX: relay legacy también usa pushMsg — CHAT: y ANSI se limpian
-		// exactamente igual que en el path XTP (OnMessage arriba).
 		pushMsg(displayName, inner.Cmd)
 		logf("[MSG %s]: %s", peer.DID, inner.Cmd)
 	}
@@ -1103,10 +1124,6 @@ func XioniaFreeString(s *C.char) {
 
 // ========== GRUPOS — FFI ==========
 
-// XioniaCreateGroup crea un grupo nuevo con el nodo local como admin.
-// Parámetros: alias (clave interna), name (nombre visible).
-// Retorna "OK" o "ERROR: ...".
-//
 //export XioniaCreateGroup
 func XioniaCreateGroup(aliasC, nameC *C.char) *C.char {
 	alias := C.GoString(aliasC)
@@ -1129,9 +1146,6 @@ func XioniaCreateGroup(aliasC, nameC *C.char) *C.char {
 	return C.CString(result)
 }
 
-// XioniaGroupSend envía un mensaje a todos los miembros del grupo.
-// Usa XTP si está disponible; cae a relay legacy si no.
-//
 //export XioniaGroupSend
 func XioniaGroupSend(aliasC, messageC *C.char) *C.char {
 	alias := C.GoString(aliasC)
@@ -1156,7 +1170,7 @@ func XioniaGroupSend(aliasC, messageC *C.char) *C.char {
 	sent := 0
 	for _, memberDID := range group.Members {
 		if memberDID == id.DID {
-			continue // no mandarse a uno mismo
+			continue
 		}
 		if globalTM != nil {
 			if _, err := globalTM.Send(memberDID, cmd); err == nil {
@@ -1171,9 +1185,6 @@ func XioniaGroupSend(aliasC, messageC *C.char) *C.char {
 	return C.CString(fmt.Sprintf("OK:%d", sent))
 }
 
-// XioniaListGroups retorna los grupos del nodo como JSON.
-// Formato: [{"alias":"g1","name":"Nombre","members":["did1","did2"],"admin":"did1"}]
-//
 //export XioniaListGroups
 func XioniaListGroups() *C.char {
 	type GroupInfo struct {
@@ -1207,9 +1218,6 @@ func XioniaListGroups() *C.char {
 	return C.CString(result)
 }
 
-// XioniaGroupAddMember agrega un DID al grupo. Solo el admin debería llamar esto.
-// Después de agregar, sincroniza el grupo al nuevo miembro (GROUP_SYNC).
-//
 //export XioniaGroupAddMember
 func XioniaGroupAddMember(aliasC, targetDIDC *C.char) *C.char {
 	alias := C.GoString(aliasC)
@@ -1234,13 +1242,11 @@ func XioniaGroupAddMember(aliasC, targetDIDC *C.char) *C.char {
 			result = "ERROR: " + err.Error()
 			return
 		}
-		// Recargar para obtener el grupo actualizado con el nuevo miembro
 		group, _ = crypto.GetGroup(alias)
 		if group == nil {
-			result = "OK" // se agregó pero no pudimos recargar
+			result = "OK"
 			return
 		}
-		// Sincronizar el grupo completo al nuevo miembro
 		groupJSON, err := json.Marshal(group)
 		if err == nil {
 			syncCmd := fmt.Sprintf("GROUP_SYNC:%s:%s", alias, string(groupJSON))
