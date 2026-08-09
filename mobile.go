@@ -760,7 +760,18 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 						globalConnWS = nil
 					}
 					connMu.Unlock()
-					if err := connectToFaroWithFallback(); err == nil {
+					// Reintentar hasta 3 veces con espera — la red puede
+					// tardar en estar disponible al cambiar WiFi→datos
+					reconectado := false
+					for intento := 1; intento <= 3; intento++ {
+						if err := connectToFaroWithFallback(); err == nil {
+							reconectado = true
+							break
+						}
+						logf("[WATCHDOG] intento %d/3 fallo, esperando 3s...", intento)
+						time.Sleep(3 * time.Second)
+					}
+					if reconectado {
 						sendAnnounce(myID)
 						if globalTM != nil {
 							globalTM.FSM().Send(xtp.EvFaroConnected, nil)
@@ -768,7 +779,7 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 						}
 						logf("[WATCHDOG] reconectado y ANNOUNCE enviado")
 					} else {
-						logf("[WATCHDOG] reconexion fallo a todos los faros")
+						logf("[WATCHDOG] reconexion fallo a todos los faros tras 3 intentos")
 					}
 				}
 			}
