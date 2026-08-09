@@ -35,6 +35,38 @@ var BuildType = "debug"
 
 // ────────────────────────────────────────────────────────────
 
+// Faros semilla — fallback automático si el principal falla
+var seedFaros = []string{
+	"190.220.45.26:54321",
+	"150.136.55.87:54321",
+}
+
+// connectToFaroWithFallback intenta conectar al faro configurado
+// y si falla prueba los faros semilla en orden.
+func connectToFaroWithFallback() error {
+	addr := config.GetFaroAddr()
+	faros := []string{}
+	if addr != "" {
+		faros = append(faros, addr)
+	}
+	for _, s := range seedFaros {
+		if s != addr {
+			faros = append(faros, s)
+		}
+	}
+	for _, faro := range faros {
+		if err := connectToFaro(faro); err == nil {
+			if faro != addr {
+				_ = config.SetFaroAddr(faro)
+				logf("[FALLBACK] conectado a faro alternativo: %s", faro)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("sin ruta a ningún faro disponible")
+}
+
+
 var dataDir string
 
 func logf(format string, args ...interface{}) {
@@ -560,6 +592,97 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 					}
 					return
 				}
+				// GROUP_JOIN: nuevo miembro manda su ACL al admin
+				if strings.HasPrefix(command, "GROUP_JOIN:") {
+					parts := strings.SplitN(command, ":", 3)
+					if len(parts) == 3 {
+						alias := parts[1]
+						aclPacket := parts[2] // "acl import did pubEd pubX"
+						// Importar ACL del nuevo miembro
+						inDataDir(func() {
+							lines := strings.Split(aclPacket, "\n")
+							for _, line := range lines {
+								line = strings.TrimSpace(line)
+								if strings.HasPrefix(line, "acl import ") {
+									fields := strings.Fields(line)
+									if len(fields) >= 5 {
+										crypto.AddPeer(fields[2], fields[3], fields[4])
+									}
+								}
+							}
+						})
+						logf("[XTP] GROUP_JOIN: %s se unió a '%s'", peerDID, alias)
+						// Si soy admin, agregar al grupo y distribuir ACLs
+						group, ok := crypto.GetGroup(alias)
+						if ok && group.Admin == myID.DID {
+							crypto.AddMember(alias, peerDID)
+							// Distribuir ACL del nuevo a todos los miembros
+							for _, memberDID := range group.Members {
+								if memberDID == myID.DID || memberDID == peerDID {
+									continue
+								}
+								shareCmd := fmt.Sprintf("GROUP_ACL_SHARE:%s:%s", alias, aclPacket)
+								if globalTM != nil {
+									globalTM.Send(memberDID, shareCmd)
+								}
+							}
+							// Mandar al nuevo las ACLs de todos los miembros
+							acl, err := crypto.LoadACL()
+							if err == nil {
+								for _, memberDID := range group.Members {
+									if memberDID == peerDID {
+										continue
+									}
+									pubEd, pubX, err2 := acl.GetPeerKeys(memberDID)
+									if err2 == nil {
+										memberACL := fmt.Sprintf("acl import %s %x %x", memberDID, pubEd, pubX)
+										shareCmd := fmt.Sprintf("GROUP_ACL_SHARE:%s:%s", alias, memberACL)
+										if globalTM != nil {
+											globalTM.Send(peerDID, shareCmd)
+										}
+									}
+								}
+							}
+							// Sync grupo actualizado
+							group, _ = crypto.GetGroup(alias)
+							if group != nil {
+								groupJSON, _ := json.Marshal(group)
+								syncCmd := fmt.Sprintf("GROUP_SYNC:%s:%s", alias, string(groupJSON))
+								for _, memberDID := range group.Members {
+									if memberDID == myID.DID {
+										continue
+									}
+									if globalTM != nil {
+										globalTM.Send(memberDID, syncCmd)
+									}
+								}
+							}
+						}
+					}
+					return
+				}
+				// GROUP_ACL_SHARE: admin distribuye ACL de un miembro
+				if strings.HasPrefix(command, "GROUP_ACL_SHARE:") {
+					parts := strings.SplitN(command, ":", 3)
+					if len(parts) == 3 {
+						aclPacket := parts[2]
+						inDataDir(func() {
+							lines := strings.Split(aclPacket, "\n")
+							for _, line := range lines {
+								line = strings.TrimSpace(line)
+								if strings.HasPrefix(line, "acl import ") {
+									fields := strings.Fields(line)
+									if len(fields) >= 5 {
+										crypto.AddPeer(fields[2], fields[3], fields[4])
+									}
+								}
+							}
+						})
+						XioniaReloadACL()
+						logf("[XTP] GROUP_ACL_SHARE: ACL importada automáticamente")
+					}
+					return
+				}
 				if strings.HasPrefix(command, "GROUP:") {
 					parts := strings.SplitN(command, ":", 3)
 					if len(parts) == 3 {
@@ -625,7 +748,7 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 			case <-quit:
 				return
 			case <-ticker.C:
-				if stale := staleSince(); stale > 20*time.Second {
+				if stale := staleSince(); stale > 10*time.Second {
 					logf("[WATCHDOG] sin actividad hace %v, forzando reconexion", stale)
 					connMu.Lock()
 					if globalConn != nil {
@@ -637,18 +760,15 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 						globalConnWS = nil
 					}
 					connMu.Unlock()
-					addr := config.GetFaroAddr()
-					if addr != "" {
-						if err := connectToFaro(addr); err == nil {
-							sendAnnounce(myID)
-							if globalTM != nil {
-								globalTM.FSM().Send(xtp.EvFaroConnected, nil)
-								globalTM.FSM().Send(xtp.EvAnnounceSent, nil)
-							}
-							logf("[WATCHDOG] reconectado y ANNOUNCE enviado")
-						} else {
-							logf("[WATCHDOG] reconexion fallo: %v", err)
+					if err := connectToFaroWithFallback(); err == nil {
+						sendAnnounce(myID)
+						if globalTM != nil {
+							globalTM.FSM().Send(xtp.EvFaroConnected, nil)
+							globalTM.FSM().Send(xtp.EvAnnounceSent, nil)
 						}
+						logf("[WATCHDOG] reconectado y ANNOUNCE enviado")
+					} else {
+						logf("[WATCHDOG] reconexion fallo a todos los faros")
 					}
 				}
 			}
@@ -699,13 +819,10 @@ func runNode(myID *crypto.Identity, quit chan struct{}) {
 				reconnectBackoff = 60 * time.Second
 			}
 
-			addr := config.GetFaroAddr()
-			if addr != "" {
-				if err := connectToFaro(addr); err == nil {
-					// Conexión exitosa — resetear backoff
-					reconnectBackoff = 2 * time.Second
-					logf("[RECONEXION] exitosa, backoff reseteado")
-				}
+			if err := connectToFaroWithFallback(); err == nil {
+				// Conexión exitosa — resetear backoff
+				reconnectBackoff = 2 * time.Second
+				logf("[RECONEXION] exitosa, backoff reseteado")
 			}
 			continue
 		}

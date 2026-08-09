@@ -4,8 +4,10 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'flutter_bridge.dart';
 
 // ============================================================================
@@ -55,11 +57,18 @@ void _showNotification(String sender, String text) {
 }
 
 // ============================================================================
+// FAROS SEMILLA — globales para MessageBus y HomeScreen
+// ============================================================================
+const List<String> _seedFaros = [
+  '190.220.45.26:54321',
+  '150.136.55.87:54321',
+];
+String _lastFaroAddr = '';
+// Badge de mensajes no leídos por DID
+Map<String, int> _unreadCounts = {};
+
+// ============================================================================
 // MESSAGE BUS
-// Un único timer en el isolate principal. Cuando el proceso vuelve de
-// background, didChangeAppLifecycleState llama reconnectAndPoll() que:
-//   1. Reconecta al faro si la conexión se cayó (el caso que reportás).
-//   2. Hace un poll inmediato sin esperar al próximo tick de 2s.
 // ============================================================================
 class MessageBus {
   MessageBus._();
@@ -84,6 +93,18 @@ class MessageBus {
     _remember(_BusEntry(mine: true, did: did, display: displayText));
   }
 
+  List<String> recentForGroup(String alias) {
+    return _recent
+        .where((e) => e.display.contains('[GRUPO:$alias]') ||
+            (e.mine && e.did == 'group:$alias'))
+        .map((e) => e.display)
+        .toList();
+  }
+
+  void addGroupMsg(String alias, String display) {
+    _remember(_BusEntry(mine: true, did: 'group:$alias', display: display));
+  }
+
   List<String> recentFor(String did, String alias) {
     return _recent
         .where((e) => e.mine
@@ -103,21 +124,28 @@ class MessageBus {
     _timer = null;
   }
 
-  /// Llamar cuando la app vuelve de background.
-  /// Reconecta al faro si la conexión se perdió, luego hace poll inmediato.
+  Future<bool> _connectWithFallback(String preferred) async {
+    final faros = [preferred, ..._seedFaros.where((f) => f != preferred)];
+    for (final faro in faros) {
+      try {
+        final r = await Future(() => Xionia.connectFaro(faro));
+        if (r.startsWith('OK') || r == 'OK') {
+          _lastFaroAddr = faro;
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  }
+
   Future<void> reconnectAndPoll() async {
     if (!Xionia.ready) return;
     try {
       final status = Xionia.getFaroAddr();
-      // Si el status termina en "(off)", la conexión se perdió.
       if (status.endsWith('(off)')) {
         final savedAddr = status.split(' (').first.trim();
-        // Hay una dirección guardada pero no hay conexión activa.
         if (savedAddr.isNotEmpty && savedAddr != 'off') {
-          // Reconectar en background (no bloquea el hilo de UI porque
-          // el Future se ejecuta asíncronamente aquí — el await solo
-          // espera la resolución del Future, no bloquea el event loop).
-          await Future(() => Xionia.connectFaro(savedAddr));
+          await _connectWithFallback(savedAddr);
         }
       }
     } catch (_) {}
@@ -137,6 +165,8 @@ class MessageBus {
       _remember(_BusEntry(mine: false, did: null, display: s));
       _controller.add(s);
 
+      // Badge: incrementar no leídos si no es el chat activo
+      final senderDID = s.contains(': ') ? s.split(': ').first : null;
       final isActiveChat = activeChatDid != null &&
           (s.contains(activeChatDid!) ||
               (activeChatAlias != null && s.contains(activeChatAlias!)));
@@ -145,6 +175,10 @@ class MessageBus {
         final sender = idx == -1 ? s : s.substring(0, idx);
         final text   = idx == -1 ? '' : s.substring(idx + 2);
         _showNotification(sender, text);
+        // Incrementar badge
+        if (senderDID != null && senderDID.isNotEmpty) {
+          _unreadCounts[senderDID] = (_unreadCounts[senderDID] ?? 0) + 1;
+        }
       }
     }
   }
@@ -194,10 +228,16 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String myDID      = '...';
+
+  // Faros semilla — lista con nombre para mostrar en UI
+  static const List<Map<String, String>> _farosList = [
+    {'name': 'Faro XionIA Principal', 'addr': '190.220.45.26:54321'},
+    {'name': 'Faro Oracle faro-01',   'addr': '150.136.55.87:54321'},
+  ];
+
   String faroStatus = 'off';
   List<dynamic> contacts = [];
   String? _loadError;
-  String _lastFaroAddr = '';
 
   static const _svcChannel = MethodChannel(_kServiceChannel);
 
@@ -251,10 +291,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && Xionia.ready) {
-      // FIX BACKGROUND: reconectar si se perdió + poll inmediato.
-      // Antes solo se llamaba pollNow() — si el Go watchdog no alcanzó
-      // a reconectar mientras el proceso estaba congelado, la app
-      // volvía sorda hasta el próximo tick del watchdog (hasta 20s).
       MessageBus.instance.reconnectAndPoll().then((_) {
         if (mounted) {
           setState(() => faroStatus = Xionia.getFaroAddr());
@@ -267,6 +303,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => contacts = Xionia.getContacts());
   }
 
+  // ── CONECTAR FARO — lista con semillas precargadas ──────────────────────
   void _connect() {
     showDialog(
       context: context,
@@ -279,22 +316,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             backgroundColor: const Color(0xFF1F2C34),
             title: const Text('Conectar al Faro',
                 style: TextStyle(color: Colors.white)),
-            content: TextField(
-              controller: ctrl,
-              enabled: !connecting,
-              style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(
-                labelText: 'IP:PUERTO',
-                labelStyle: TextStyle(color: Colors.grey),
-                enabledBorder: UnderlineInputBorder(
-                    borderSide: BorderSide(color: Color(0xFF128C7E))),
-              ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Lista de faros semilla
+                ...(_farosList.map((f) => ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.router, color: Color(0xFF25D366), size: 18),
+                  title: Text(f['name']!,
+                      style: const TextStyle(color: Colors.white, fontSize: 13)),
+                  subtitle: Text(f['addr']!,
+                      style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                  onTap: () => ctrl.text = f['addr']!,
+                ))),
+                const Divider(color: Colors.grey),
+                // Campo manual
+                TextField(
+                  controller: ctrl,
+                  enabled: !connecting,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: const InputDecoration(
+                    labelText: 'O ingresá IP:PUERTO manualmente',
+                    labelStyle: TextStyle(color: Colors.grey),
+                    enabledBorder: UnderlineInputBorder(
+                        borderSide: BorderSide(color: Color(0xFF128C7E))),
+                  ),
+                ),
+              ],
             ),
             actions: [
               TextButton(
                 onPressed: connecting ? null : () => Navigator.pop(context),
-                child:
-                    const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+                child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
               ),
               TextButton(
                 onPressed: connecting
@@ -315,8 +369,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       },
                 child: connecting
                     ? const SizedBox(
-                        width: 16,
-                        height: 16,
+                        width: 16, height: 16,
                         child: CircularProgressIndicator(
                             strokeWidth: 2, color: Color(0xFF25D366)),
                       )
@@ -330,42 +383,63 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  // ── MI IDENTIDAD CON QR ─────────────────────────────────────────────────
   void _showMyIdentity() {
-    final id = Xionia.getMyIdentity();
+    final packet = Xionia.exportACL(); // acl import did:maia:... pubEd pubX
+    final id     = Xionia.getMyIdentity();
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF1F2C34),
-        title:
-            const Text('Mi Identidad', style: TextStyle(color: Colors.white)),
+        title: const Text('Mi Identidad',
+            style: TextStyle(color: Colors.white)),
         content: SingleChildScrollView(
-          child: SelectableText(id,
-              style: const TextStyle(
-                  color: Colors.white, fontFamily: 'monospace', fontSize: 12)),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // QR con el acl import para que otros escaneen
+              Container(
+                color: Colors.white,
+                padding: const EdgeInsets.all(8),
+                child: QrImageView(
+                  data: packet,
+                  version: QrVersions.auto,
+                  size: 200,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text('Otros pueden escanear este QR para agregarte',
+                  style: TextStyle(color: Colors.grey, fontSize: 11),
+                  textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              SelectableText(id,
+                  style: const TextStyle(
+                      color: Colors.white, fontFamily: 'monospace', fontSize: 11)),
+            ],
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () {
-              Clipboard.setData(ClipboardData(text: id));
-              Navigator.pop(context);
+              Clipboard.setData(ClipboardData(text: packet));
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(
-                    content: Text('Copiado'), duration: Duration(seconds: 1)),
+                    content: Text('Copiado al portapapeles'),
+                    duration: Duration(seconds: 1)),
               );
             },
-            child:
-                const Text('Copiar', style: TextStyle(color: Color(0xFF25D366))),
+            child: const Text('Copiar', style: TextStyle(color: Color(0xFF25D366))),
           ),
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child:
-                const Text('Cerrar', style: TextStyle(color: Colors.grey)),
+            child: const Text('Cerrar', style: TextStyle(color: Colors.grey)),
           ),
         ],
       ),
     );
   }
 
+  // ── COMPARTIR RED (texto) ────────────────────────────────────────────────
   void _shareACL() {
     final packet = Xionia.exportACL();
     showDialog(
@@ -402,6 +476,65 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  // ── ESCANEAR QR ─────────────────────────────────────────────────────────
+  Future<void> _scanQR() async {
+    // Pedir permiso de cámara
+    final status = await Permission.camera.request();
+    if (!status.isGranted) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Se necesita permiso de cámara')),
+        );
+      }
+      return;
+    }
+
+    if (!mounted) return;
+    final result = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => const _QRScanScreen()),
+    );
+
+    if (result == null || result.isEmpty) return;
+
+    // Detectar si es un acl import (contacto) o IP:PUERTO (faro)
+    if (result.startsWith('acl import ')) {
+      // Es un contacto
+      Xionia.importACL(result);
+      Xionia.reloadACL();
+      _loadContacts();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+              content: Text('✅ Contacto agregado'),
+              backgroundColor: Color(0xFF128C7E)),
+        );
+      }
+    } else if (result.contains(':') && !result.contains(' ')) {
+      // Parece una IP:PUERTO — conectar al faro
+      final r = await Future(() => Xionia.connectFaro(result));
+      _lastFaroAddr = result;
+      if (mounted) {
+        setState(() => faroStatus = Xionia.getFaroAddr());
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Faro: $r'),
+          backgroundColor: const Color(0xFF1F2C34),
+        ));
+      }
+    } else {
+      // Intentar como ACL de todos modos
+      Xionia.importACL(result);
+      Xionia.reloadACL();
+      _loadContacts();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('QR procesado')),
+        );
+      }
+    }
+  }
+
+  // ── AGREGAR CONTACTO (manual) ────────────────────────────────────────────
   void _addContact() {
     showDialog(
       context: context,
@@ -460,8 +593,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF1F2C34),
-        title:
-            const Text('Poner Alias', style: TextStyle(color: Colors.white)),
+        title: const Text('Poner Alias', style: TextStyle(color: Colors.white)),
         content: TextField(
           controller: ctrl,
           style: const TextStyle(color: Colors.white),
@@ -475,8 +607,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child:
-                const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+            child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
           ),
           TextButton(
             onPressed: () {
@@ -489,8 +620,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               _loadContacts();
               Navigator.pop(context);
             },
-            child:
-                const Text('Guardar', style: TextStyle(color: Color(0xFF25D366))),
+            child: const Text('Guardar',
+                style: TextStyle(color: Color(0xFF25D366))),
           ),
         ],
       ),
@@ -537,7 +668,92 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  // ── ACERCA DE / AYUDA ───────────────────────────────────────────────────
+  void _showAbout() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF1F2C34),
+        title: const Text('XionChat',
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('v1.0.4 — XionIA Faraday',
+                  style: TextStyle(color: Color(0xFF25D366), fontSize: 13)),
+              const SizedBox(height: 12),
+              const Text(
+                'Mensajería soberana. Sin servidores centrales. '
+                'Sin metadatos. Tu identidad es tu clave privada.',
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+              const Text('RECURSOS',
+                  style: TextStyle(color: Colors.grey, fontSize: 11,
+                      letterSpacing: 1.2)),
+              const SizedBox(height: 8),
+              _aboutLink('🌐 Sitio web', 'xionia.uk'),
+              _aboutLink('📡 Cómo montar tu propio Faro', 'xionia.uk/faros'),
+              _aboutLink('🔑 Qué es un DID soberano', 'xionia.uk/identidad'),
+              _aboutLink('💎 Versiones avanzadas', 'xionia.uk/versiones'),
+              const SizedBox(height: 16),
+              const Text('FAROS DISPONIBLES',
+                  style: TextStyle(color: Colors.grey, fontSize: 11,
+                      letterSpacing: 1.2)),
+              const SizedBox(height: 8),
+              ...(_farosList.map((f) => Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(children: [
+                  const Icon(Icons.router, color: Color(0xFF25D366), size: 14),
+                  const SizedBox(width: 6),
+                  Text('${f['name']}\n${f['addr']}',
+                      style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                ]),
+              ))),
+              const SizedBox(height: 12),
+              const Text(
+                '"La soberanía no se pide. Se compila."',
+                style: TextStyle(color: Colors.grey, fontSize: 11,
+                    fontStyle: FontStyle.italic),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cerrar', style: TextStyle(color: Color(0xFF25D366))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _aboutLink(String label, String url) {
+    return InkWell(
+      onTap: () {
+        Clipboard.setData(ClipboardData(text: 'https://$url'));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Copiado: $url'),
+              duration: const Duration(seconds: 1)),
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Text(label,
+            style: const TextStyle(
+                color: Color(0xFF128C7E),
+                fontSize: 13,
+                decoration: TextDecoration.underline)),
+      ),
+    );
+  }
+
   void _openChat(String did, String displayName) {
+    // Resetear badge al abrir el chat
+    _unreadCounts.remove(did);
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -577,8 +793,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     style: TextStyle(color: Colors.white, fontSize: 16)),
                 const SizedBox(height: 8),
                 Text(_loadError!,
-                    style:
-                        const TextStyle(color: Colors.grey, fontSize: 12),
+                    style: const TextStyle(color: Colors.grey, fontSize: 12),
                     textAlign: TextAlign.center),
               ],
             ),
@@ -602,6 +817,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ],
         ),
         actions: [
+          // Indicador de faro
           IconButton(
             icon: Icon(
               faroStatus.contains('off')
@@ -611,38 +827,91 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
             onPressed: _connect,
           ),
+          // Grupos
           IconButton(
             icon: const Icon(Icons.group, color: Color(0xFF25D366)),
             tooltip: 'Grupos',
             onPressed: _openGroups,
           ),
+          // Menú
           PopupMenuButton<String>(
             color: const Color(0xFF1F2C34),
             onSelected: (v) {
               if (v == 'identity') _showMyIdentity();
-              if (v == 'share') _shareACL();
-              if (v == 'reset') _showResetMenu();
+              if (v == 'share')    _shareACL();
+              if (v == 'scan')     _scanQR();
+              if (v == 'about')    _showAbout();
+              if (v == 'reset')    _showResetMenu();
             },
             itemBuilder: (_) => [
               const PopupMenuItem(
                   value: 'identity',
-                  child: Text('Mi Identidad',
-                      style: TextStyle(color: Colors.white))),
+                  child: Row(children: [
+                    Icon(Icons.qr_code, color: Color(0xFF25D366), size: 18),
+                    SizedBox(width: 8),
+                    Text('Mi Identidad (QR)',
+                        style: TextStyle(color: Colors.white)),
+                  ])),
+              const PopupMenuItem(
+                  value: 'scan',
+                  child: Row(children: [
+                    Icon(Icons.qr_code_scanner, color: Color(0xFF25D366), size: 18),
+                    SizedBox(width: 8),
+                    Text('Escanear QR',
+                        style: TextStyle(color: Colors.white)),
+                  ])),
               const PopupMenuItem(
                   value: 'share',
-                  child: Text('Compartir Red',
-                      style: TextStyle(color: Colors.white))),
+                  child: Row(children: [
+                    Icon(Icons.share, color: Colors.white70, size: 18),
+                    SizedBox(width: 8),
+                    Text('Compartir Red',
+                        style: TextStyle(color: Colors.white)),
+                  ])),
+              const PopupMenuItem(
+                  value: 'about',
+                  child: Row(children: [
+                    Icon(Icons.info_outline, color: Colors.white70, size: 18),
+                    SizedBox(width: 8),
+                    Text('Acerca de / Ayuda',
+                        style: TextStyle(color: Colors.white)),
+                  ])),
+              const PopupMenuDivider(),
               const PopupMenuItem(
                   value: 'reset',
-                  child: Text('RESET', style: TextStyle(color: Colors.red))),
+                  child: Row(children: [
+                    Icon(Icons.delete_forever, color: Colors.red, size: 18),
+                    SizedBox(width: 8),
+                    Text('RESET', style: TextStyle(color: Colors.red)),
+                  ])),
             ],
           ),
         ],
       ),
       body: contacts.isEmpty
-          ? const Center(
-              child: Text('Sin contactos. Agregá uno con el +',
-                  style: TextStyle(color: Colors.grey)))
+          ? Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Sin contactos',
+                      style: TextStyle(color: Colors.grey, fontSize: 16)),
+                  const SizedBox(height: 8),
+                  const Text('Agregá uno con el + o escaneá un QR',
+                      style: TextStyle(color: Colors.grey, fontSize: 13)),
+                  const SizedBox(height: 24),
+                  OutlinedButton.icon(
+                    onPressed: _scanQR,
+                    icon: const Icon(Icons.qr_code_scanner,
+                        color: Color(0xFF25D366)),
+                    label: const Text('Escanear QR',
+                        style: TextStyle(color: Color(0xFF25D366))),
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: Color(0xFF25D366)),
+                    ),
+                  ),
+                ],
+              ),
+            )
           : ListView.builder(
               itemCount: contacts.length,
               itemBuilder: (_, i) {
@@ -650,14 +919,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 final did     = c['did'].toString();
                 final alias   = (c['alias'] ?? '').toString();
                 final display = alias.isNotEmpty ? alias : did;
+                final unread = _unreadCounts[did] ?? 0;
                 return ListTile(
                   leading: CircleAvatar(
                     backgroundColor: const Color(0xFF128C7E),
                     child: Text(display[0].toUpperCase(),
                         style: const TextStyle(color: Colors.white)),
                   ),
-                  title: Text(display,
-                      style: const TextStyle(color: Colors.white)),
+                  title: Row(
+                    children: [
+                      Expanded(
+                        child: Text(display,
+                            style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: unread > 0
+                                    ? FontWeight.bold
+                                    : FontWeight.normal)),
+                      ),
+                      if (unread > 0)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF25D366),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            unread > 99 ? '99+' : '$unread',
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                    ],
+                  ),
                   subtitle: Text(did,
                       style: const TextStyle(
                           color: Colors.grey, fontSize: 12),
@@ -668,10 +964,85 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 );
               },
             ),
-      floatingActionButton: FloatingActionButton(
-        backgroundColor: const Color(0xFF25D366),
-        onPressed: _addContact,
-        child: const Icon(Icons.person_add, color: Colors.white),
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Botón escanear QR
+          FloatingActionButton.small(
+            heroTag: 'scan',
+            backgroundColor: const Color(0xFF128C7E),
+            onPressed: _scanQR,
+            child: const Icon(Icons.qr_code_scanner, color: Colors.white),
+          ),
+          const SizedBox(height: 8),
+          // Botón agregar contacto manual
+          FloatingActionButton(
+            heroTag: 'add',
+            backgroundColor: const Color(0xFF25D366),
+            onPressed: _addContact,
+            child: const Icon(Icons.person_add, color: Colors.white),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// PANTALLA ESCÁNER QR
+// ============================================================================
+class _QRScanScreen extends StatefulWidget {
+  const _QRScanScreen();
+  @override
+  State<_QRScanScreen> createState() => _QRScanScreenState();
+}
+
+class _QRScanScreenState extends State<_QRScanScreen> {
+  bool _scanned = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1F2C34),
+        title: const Text('Escanear QR',
+            style: TextStyle(color: Colors.white)),
+      ),
+      body: Stack(
+        children: [
+          MobileScanner(
+            onDetect: (capture) {
+              if (_scanned) return;
+              final barcode = capture.barcodes.firstOrNull;
+              if (barcode?.rawValue != null) {
+                _scanned = true;
+                Navigator.pop(context, barcode!.rawValue);
+              }
+            },
+          ),
+          // Marco visual
+          Center(
+            child: Container(
+              width: 250,
+              height: 250,
+              decoration: BoxDecoration(
+                border: Border.all(color: const Color(0xFF25D366), width: 2),
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+          ),
+          Positioned(
+            bottom: 32,
+            left: 0,
+            right: 0,
+            child: const Text(
+              'Apuntá al QR de tu contacto o faro',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -679,7 +1050,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
 // ============================================================================
 // GROUPS SCREEN
-// Lista grupos, crea nuevos, agrega miembros, abre GroupChatScreen.
 // ============================================================================
 class GroupsScreen extends StatefulWidget {
   const GroupsScreen({super.key});
@@ -698,6 +1068,58 @@ class _GroupsScreenState extends State<GroupsScreen> {
 
   void _reload() {
     setState(() => _groups = Xionia.listGroups());
+  }
+
+  void _showGroupQR(String alias, String name) {
+    final myACL = Xionia.exportACL();
+    // Formato: xion-group:alias:nombre:aclPacket
+    final qrData = 'xion-group:$alias:$name:$myACL';
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF1F2C34),
+        title: Text('QR Grupo: $name',
+            style: const TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              color: Colors.white,
+              padding: const EdgeInsets.all(8),
+              child: QrImageView(
+                data: qrData,
+                version: QrVersions.auto,
+                size: 220,
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Compartí este QR con quien quieras agregar al grupo.\nAl escanearlo se unirá automáticamente.',
+              style: TextStyle(color: Colors.grey, fontSize: 11),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: qrData));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('QR copiado'),
+                    duration: Duration(seconds: 1)),
+              );
+            },
+            child: const Text('Copiar',
+                style: TextStyle(color: Color(0xFF25D366))),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cerrar',
+                style: TextStyle(color: Colors.grey)),
+          ),
+        ],
+      ),
+    );
   }
 
   void _createGroup() {
@@ -848,14 +1270,24 @@ class _GroupsScreenState extends State<GroupsScreen> {
                     '${isAdmin ? ' · admin' : ''}',
                     style: const TextStyle(color: Colors.grey, fontSize: 12),
                   ),
-                  trailing: isAdmin
-                      ? IconButton(
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.qr_code,
+                            color: Color(0xFF128C7E)),
+                        tooltip: 'QR del grupo',
+                        onPressed: () => _showGroupQR(alias, name),
+                      ),
+                      if (isAdmin)
+                        IconButton(
                           icon: const Icon(Icons.person_add,
                               color: Color(0xFF25D366)),
                           tooltip: 'Agregar miembro',
                           onPressed: () => _addMember(alias),
-                        )
-                      : null,
+                        ),
+                    ],
+                  ),
                   onTap: () => Navigator.push(
                     context,
                     MaterialPageRoute(
@@ -886,15 +1318,14 @@ class GroupChatScreen extends StatefulWidget {
 }
 
 class _GroupChatScreenState extends State<GroupChatScreen> {
-  final _ctrl      = TextEditingController();
-  final _msgs      = <String>[];
+  final _ctrl       = TextEditingController();
+  final _msgs       = <String>[];
   final _scrollCtrl = ScrollController();
   StreamSubscription<String>? _sub;
 
   @override
   void initState() {
     super.initState();
-    // Escuchar mensajes de grupo en el bus
     _sub = MessageBus.instance.stream.listen((m) {
       if (m.contains('[GRUPO:${widget.alias}]')) {
         setState(() => _msgs.add(m));
@@ -983,8 +1414,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           ),
           Container(
             color: const Color(0xFF1F2C34),
-            padding:
-                const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             child: Row(
               children: [
                 Expanded(
@@ -1013,7 +1443,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 }
 
 // ============================================================================
-// CHAT SCREEN (sin cambios respecto a la versión anterior)
+// CHAT SCREEN
 // ============================================================================
 class ChatScreen extends StatefulWidget {
   final String did;
@@ -1024,8 +1454,8 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final _ctrl      = TextEditingController();
-  final _msgs      = <String>[];
+  final _ctrl       = TextEditingController();
+  final _msgs       = <String>[];
   final _scrollCtrl = ScrollController();
   StreamSubscription<String>? _sub;
   bool _recording = false;
@@ -1213,8 +1643,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           Container(
             color: const Color(0xFF1F2C34),
-            padding:
-                const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             child: Row(
               children: [
                 Expanded(

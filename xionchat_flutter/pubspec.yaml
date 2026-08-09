@@ -13,6 +13,8 @@ dependencies:
   path_provider: ^2.1.1
   permission_handler: ^11.0.0
   flutter_local_notifications: ^17.0.0
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^4.0.1
 
 dev_dependencies:
   flutter_test:
