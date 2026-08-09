@@ -4,7 +4,7 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 android {
-    namespace = "com.example.xionchat_flutter"
+    namespace = "com.xionia.xionchat"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = "25.1.8937393"
     compileOptions {
@@ -16,7 +16,7 @@ android {
         jvmTarget = '1.8'
     }
     defaultConfig {
-        applicationId = "com.example.xionchat_flutter"
+        applicationId = "com.xionia.xionchat"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

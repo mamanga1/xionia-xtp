@@ -1,4 +1,4 @@
-package com.example.xionchat_flutter
+package com.xionia.xionchat
 
 import android.app.Application
 import android.content.Context

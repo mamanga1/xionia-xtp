@@ -1,4 +1,4 @@
-package com.example.xionchat_flutter
+package com.xionia.xionchat
 
 import android.app.Notification
 import android.app.NotificationChannel

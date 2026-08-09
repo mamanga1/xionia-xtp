@@ -1,4 +1,4 @@
-package com.example.xionchat_flutter
+package com.xionia.xionchat
 import android.content.Intent
 import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
