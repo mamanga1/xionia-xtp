@@ -1,0 +1,1 @@
+Sovereign P2P encrypted messaging. No servers. No metadata.

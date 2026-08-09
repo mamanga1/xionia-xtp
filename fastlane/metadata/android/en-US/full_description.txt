@@ -1,0 +1,15 @@
+XionChat is a sovereign messaging app that works without central servers.
+
+Your identity is your cryptographic key (DID). Nobody can take it from you.
+
+FEATURES:
+- Noise IK end-to-end encryption
+- UDP hole punching — works behind CGNAT
+- No phone number or email account required
+- Encrypted P2P groups
+- Federated beacons for redundancy
+- 100% open source
+
+More info: https://iap2p.uk/
+
+"Sovereignty is not asked for. It is compiled."

@@ -1,0 +1,15 @@
+XionChat es una aplicación de mensajería soberana sin servidores centrales.
+
+Tu identidad es tu clave criptográfica (DID). Nadie puede quitártela.
+
+CARACTERÍSTICAS:
+- Cifrado Noise IK end-to-end
+- Hole punching UDP — funciona detrás de CGNAT
+- Sin número de teléfono ni cuenta de email
+- Grupos cifrados P2P
+- Faros federados para redundancia
+- Código fuente 100% abierto
+
+Más info: https://iap2p.uk/
+
+"La soberanía no se pide. Se compila."
